@@ -1,0 +1,325 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>PSD 图层重命名工具</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-50 min-h-screen" style="font-family:-apple-system,BlinkMacSystemFont,'PingFang SC','Microsoft YaHei',sans-serif">
+
+  <header class="bg-white border-b border-gray-200 px-6 py-4 mb-6">
+    <div class="max-w-2xl mx-auto flex items-center gap-3">
+      <div class="w-9 h-9 bg-indigo-600 rounded-xl flex items-center justify-center text-xl">🎨</div>
+      <div>
+        <h1 class="text-lg font-bold text-gray-900">PSD 图层重命名工具</h1>
+        <p class="text-xs text-gray-400">设置路径 → 配置命名 → 一键处理所有 PSD</p>
+      </div>
+    </div>
+  </header>
+
+  <main class="max-w-2xl mx-auto px-4 pb-16 space-y-4">
+
+    <!-- Step 1: Doc (optional) -->
+    <div class="bg-white rounded-2xl border border-gray-200 shadow-sm p-5">
+      <div class="flex items-center gap-2 mb-3">
+        <span class="w-6 h-6 rounded-full bg-indigo-100 text-indigo-700 text-xs font-bold flex items-center justify-center">1</span>
+        <h2 class="font-semibold text-gray-800">命名规则文档 <span class="text-xs font-normal text-gray-400">（可选）</span></h2>
+      </div>
+      <div class="flex gap-2">
+        <input id="doc-path" type="text"
+          class="flex-1 px-3 py-2 text-sm border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-300"
+          placeholder="可选：选择 .docx 文件解析规则" oninput="save()" />
+        <button onclick="pickFile('doc-path')"
+          class="px-3 py-2 text-sm border border-gray-300 rounded-lg bg-white hover:bg-gray-50 whitespace-nowrap">
+          📄 选择文件
+        </button>
+      </div>
+    </div>
+
+    <!-- Step 2: Folders -->
+    <div class="bg-white rounded-2xl border border-gray-200 shadow-sm p-5">
+      <div class="flex items-center gap-2 mb-3">
+        <span class="w-6 h-6 rounded-full bg-indigo-100 text-indigo-700 text-xs font-bold flex items-center justify-center">2</span>
+        <h2 class="font-semibold text-gray-800">文件夹设置</h2>
+      </div>
+      <div class="space-y-3">
+        <div>
+          <label class="block text-sm text-gray-600 mb-1">PSD 输入文件夹</label>
+          <div class="flex gap-2">
+            <input id="input-folder" type="text"
+              class="flex-1 px-3 py-2 text-sm border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-300"
+              placeholder="包含原始 PSD 的文件夹" oninput="save()" />
+            <button onclick="pickFolder('input-folder','PSD 输入文件夹')"
+              class="px-3 py-2 text-sm border border-gray-300 rounded-lg bg-white hover:bg-gray-50 whitespace-nowrap">📁 选择</button>
+            <button onclick="previewPSD()"
+              class="px-3 py-2 text-sm border border-gray-300 rounded-lg bg-white hover:bg-gray-50 whitespace-nowrap text-gray-600">预览</button>
+          </div>
+          <div id="psd-list" class="mt-2 hidden">
+            <p id="psd-count" class="text-xs text-gray-500 mb-1.5"></p>
+            <div id="psd-names" class="flex flex-wrap gap-1"></div>
+          </div>
+          <p id="psd-error" class="mt-1 text-xs text-red-500 hidden"></p>
+        </div>
+        <div>
+          <label class="block text-sm text-gray-600 mb-1">PSD 输出文件夹</label>
+          <div class="flex gap-2">
+            <input id="output-folder" type="text"
+              class="flex-1 px-3 py-2 text-sm border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-300"
+              placeholder="处理后的 PSD 保存位置" oninput="save()" />
+            <button onclick="pickFolder('output-folder','PSD 输出文件夹')"
+              class="px-3 py-2 text-sm border border-gray-300 rounded-lg bg-white hover:bg-gray-50 whitespace-nowrap">📁 选择</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Step 3: Type-based naming -->
+    <div class="bg-white rounded-2xl border border-gray-200 shadow-sm p-5">
+      <div class="flex items-center gap-2 mb-1">
+        <span class="w-6 h-6 rounded-full bg-indigo-100 text-indigo-700 text-xs font-bold flex items-center justify-center">3</span>
+        <h2 class="font-semibold text-gray-800">图层命名配置</h2>
+      </div>
+      <p class="text-xs text-gray-400 mb-4 ml-8">按图层类型自动重命名，无需依赖原始图层名称。文字层自动编号（text1, text2…）。</p>
+
+      <div class="space-y-2">
+        <!-- Text row (fixed) -->
+        <div class="flex items-center gap-3 px-3 py-2.5 bg-gray-50 rounded-xl">
+          <div class="flex items-center gap-2 w-44">
+            <span class="text-base">T</span>
+            <span class="text-sm font-medium text-gray-700">文字层</span>
+          </div>
+          <span class="text-gray-400 text-sm">→</span>
+          <code class="text-sm text-indigo-600 bg-indigo-50 px-2 py-0.5 rounded">text1, text2, text3…</code>
+          <span class="ml-auto text-xs text-gray-400">自动编号，不可修改</span>
+        </div>
+        <!-- Pixel row -->
+        <div class="flex items-center gap-3 px-3 py-2 bg-white border border-gray-200 rounded-xl">
+          <div class="flex items-center gap-2 w-44">
+            <span class="text-base">🖼</span>
+            <span class="text-sm text-gray-700">图片层 / 智能对象</span>
+          </div>
+          <span class="text-gray-400 text-sm">→</span>
+          <input id="name-pixel" type="text" value="scenebg" oninput="save()"
+            class="flex-1 px-2 py-1 text-sm border border-gray-300 rounded-lg focus:outline-none focus:ring-1 focus:ring-indigo-300 font-mono" />
+        </div>
+        <!-- Shape row -->
+        <div class="flex items-center gap-3 px-3 py-2 bg-white border border-gray-200 rounded-xl">
+          <div class="flex items-center gap-2 w-44">
+            <span class="text-base">⬜</span>
+            <span class="text-sm text-gray-700">形状层</span>
+          </div>
+          <span class="text-gray-400 text-sm">→</span>
+          <input id="name-shape" type="text" value="stickerbg" oninput="save()"
+            class="flex-1 px-2 py-1 text-sm border border-gray-300 rounded-lg focus:outline-none focus:ring-1 focus:ring-indigo-300 font-mono" />
+        </div>
+      </div>
+
+      <p class="text-xs text-gray-400 mt-3 ml-1">
+        💡 同类型多个图层时自动加编号（如 product1, product2）；只有一个时直接用名称（如 product）。
+      </p>
+    </div>
+
+    <!-- Step 4: Action -->
+    <div class="bg-white rounded-2xl border border-gray-200 shadow-sm p-5">
+      <div class="flex items-center gap-2 mb-4">
+        <span class="w-6 h-6 rounded-full bg-green-100 text-green-700 text-xs font-bold flex items-center justify-center">4</span>
+        <h2 class="font-semibold text-gray-800">开始处理</h2>
+      </div>
+
+      <div class="flex gap-3">
+        <button id="btn-run" onclick="runProcess()"
+          class="flex-1 py-4 text-lg font-bold text-white rounded-xl bg-gradient-to-r from-indigo-600 to-violet-600 hover:from-indigo-700 hover:to-violet-700 active:scale-[0.98] transition-all shadow-md shadow-indigo-200">
+          🚀 开始处理 PSD
+        </button>
+        <button id="btn-stop" onclick="stopProcess()" disabled
+          class="px-5 py-4 text-sm font-medium text-red-600 border-2 border-red-200 rounded-xl hover:bg-red-50 disabled:opacity-30 disabled:cursor-not-allowed transition-all">
+          ⛔ 终止
+        </button>
+      </div>
+      <p class="text-center text-xs text-gray-400 mt-2">自动打开 Photoshop 批量处理所有 PSD，完成后保存至输出文件夹</p>
+      <p id="run-error" class="mt-2 text-xs text-red-500 hidden"></p>
+
+      <div id="run-result" class="hidden mt-4 flex items-center gap-3 p-3 bg-green-50 border border-green-200 rounded-xl">
+        <span class="text-2xl">✅</span>
+        <div>
+          <p class="text-sm font-semibold text-green-800">Photoshop 已启动，正在处理…</p>
+          <p class="text-xs text-green-700 mt-0.5">处理完成后 Photoshop 会弹出提示，PSD 文件将保存至输出文件夹。</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- Log -->
+    <div class="bg-white rounded-2xl border border-gray-200 shadow-sm p-5">
+      <div class="flex items-center justify-between mb-2">
+        <span class="text-sm font-medium text-gray-700">运行日志</span>
+        <button onclick="clearLogs()" class="text-xs text-gray-400 hover:text-gray-600">清除</button>
+      </div>
+      <div id="log-panel"
+        class="bg-gray-900 rounded-xl p-3 h-36 overflow-y-auto text-xs text-gray-300 space-y-0.5"
+        style="font-family:'SF Mono',Menlo,Consolas,monospace">
+        <p class="text-gray-500">— 等待操作 —</p>
+      </div>
+    </div>
+
+  </main>
+
+  <script>
+    const STORE_KEY = "psd_renamer_v1";
+    let logPoller = null;
+
+    // ── Persist & Restore ────────────────────────────────────
+    function save() {
+      const data = {
+        docPath:     document.getElementById("doc-path").value,
+        inputFolder: document.getElementById("input-folder").value,
+        outputFolder:document.getElementById("output-folder").value,
+        namePixel:   document.getElementById("name-pixel").value,
+        nameShape:   document.getElementById("name-shape").value,
+      };
+      localStorage.setItem(STORE_KEY, JSON.stringify(data));
+    }
+
+    function restore() {
+      try {
+        const data = JSON.parse(localStorage.getItem(STORE_KEY) || "{}");
+        if (data.docPath)      document.getElementById("doc-path").value      = data.docPath;
+        if (data.inputFolder)  document.getElementById("input-folder").value  = data.inputFolder;
+        if (data.outputFolder) document.getElementById("output-folder").value = data.outputFolder;
+        if (data.namePixel)    document.getElementById("name-pixel").value    = data.namePixel;
+        if (data.nameShape)    document.getElementById("name-shape").value    = data.nameShape;
+      } catch(e) {}
+    }
+
+    // ── Pickers ──────────────────────────────────────────────
+    async function pickFolder(inputId, prompt) {
+      try {
+        const res = await fetch("/api/pick_folder", {
+          method:"POST", headers:{"Content-Type":"application/json"},
+          body: JSON.stringify({prompt})
+        });
+        const d = await res.json();
+        if (d.path) { document.getElementById(inputId).value = d.path; save(); }
+      } catch(e) { appendLog("❌ " + e.message); }
+    }
+
+    async function pickFile(inputId) {
+      try {
+        const res = await fetch("/api/pick_file", {
+          method:"POST", headers:{"Content-Type":"application/json"},
+          body: JSON.stringify({})
+        });
+        const d = await res.json();
+        if (d.path) { document.getElementById(inputId).value = d.path; save(); }
+      } catch(e) { appendLog("❌ " + e.message); }
+    }
+
+    // ── Preview PSDs ─────────────────────────────────────────
+    async function previewPSD() {
+      hideErr("psd-error");
+      const folder = document.getElementById("input-folder").value.trim();
+      if (!folder) { showErr("psd-error", "请先选择输入文件夹"); return; }
+      try {
+        const res = await fetch("/api/preview_psd", {
+          method:"POST", headers:{"Content-Type":"application/json"},
+          body: JSON.stringify({input_folder: folder})
+        });
+        const d = await res.json();
+        if (d.error) { showErr("psd-error", d.error); return; }
+        document.getElementById("psd-count").textContent = `找到 ${d.count} 个 PSD 文件`;
+        document.getElementById("psd-names").innerHTML = (d.files||[]).map(f =>
+          `<span class="px-2 py-0.5 bg-indigo-50 text-indigo-700 text-xs rounded border border-indigo-100">${f}</span>`
+        ).join("");
+        document.getElementById("psd-list").classList.remove("hidden");
+        appendLog(`📁 找到 ${d.count} 个 PSD 文件`);
+      } catch(e) { showErr("psd-error", "请求失败: " + e.message); }
+    }
+
+    // ── Run ──────────────────────────────────────────────────
+    async function runProcess() {
+      hideErr("run-error");
+      document.getElementById("run-result").classList.add("hidden");
+
+      const inputFolder  = document.getElementById("input-folder").value.trim();
+      const outputFolder = document.getElementById("output-folder").value.trim();
+      const namePixel    = document.getElementById("name-pixel").value.trim() || "scenebg";
+      const nameShape    = document.getElementById("name-shape").value.trim() || "stickerbg";
+
+      if (!inputFolder)  { showErr("run-error", "请填写 PSD 输入文件夹"); return; }
+      if (!outputFolder) { showErr("run-error", "请填写 PSD 输出文件夹"); return; }
+
+      setRunning(true);
+      try {
+        const res = await fetch("/api/run", {
+          method:"POST", headers:{"Content-Type":"application/json"},
+          body: JSON.stringify({
+            input_folder:  inputFolder,
+            output_folder: outputFolder,
+            type_rules: { pixel: namePixel, smart: namePixel, shape: nameShape }
+          })
+        });
+        const d = await res.json();
+        if (d.error) { showErr("run-error", d.error); setRunning(false); return; }
+        document.getElementById("run-result").classList.remove("hidden");
+        appendLog("🚀 Photoshop 已启动，正在批量处理 PSD…");
+        startLogPoller();
+      } catch(e) {
+        showErr("run-error", "请求失败: " + e.message);
+        setRunning(false);
+      }
+    }
+
+    // ── Stop ─────────────────────────────────────────────────
+    async function stopProcess() {
+      try {
+        await fetch("/api/stop", { method:"POST" });
+        appendLog("⛔ 已发送终止指令");
+      } catch(e) {}
+      setRunning(false);
+      document.getElementById("run-result").classList.add("hidden");
+    }
+
+    function setRunning(running) {
+      document.getElementById("btn-run").disabled  = running;
+      document.getElementById("btn-stop").disabled = !running;
+      document.getElementById("btn-run").textContent = running ? "⏳ 处理中…" : "🚀 开始处理 PSD";
+    }
+
+    // ── Logs ─────────────────────────────────────────────────
+    function appendLog(msg) {
+      const panel = document.getElementById("log-panel");
+      panel.querySelector(".text-gray-500")?.remove();
+      const p = document.createElement("p");
+      const ts = new Date().toLocaleTimeString("zh-CN",{hour12:false});
+      p.textContent = `[${ts}] ${msg}`;
+      panel.appendChild(p);
+      panel.scrollTop = panel.scrollHeight;
+    }
+    function clearLogs() {
+      document.getElementById("log-panel").innerHTML = '<p class="text-gray-500">— 已清除 —</p>';
+    }
+    function startLogPoller() {
+      if (logPoller) return;
+      let last = 0;
+      logPoller = setInterval(async () => {
+        try {
+          const d = await (await fetch("/api/status")).json();
+          (d.logs||[]).slice(last).forEach(l => appendLog(l));
+          last = (d.logs||[]).length;
+          if (!d.running) {
+            clearInterval(logPoller); logPoller = null;
+            setRunning(false);
+          }
+        } catch(e) {}
+      }, 2000);
+    }
+
+    // ── Helpers ──────────────────────────────────────────────
+    function showErr(id, msg) { const e = document.getElementById(id); e.textContent=msg; e.classList.remove("hidden"); }
+    function hideErr(id) { document.getElementById(id).classList.add("hidden"); }
+
+    // ── Init ─────────────────────────────────────────────────
+    window.addEventListener("DOMContentLoaded", restore);
+  </script>
+</body>
+</html>
