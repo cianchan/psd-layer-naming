@@ -459,11 +459,9 @@ function renamePSDLayer(layer, counters, totalCounts) {{
     var base = getBaseName(layer);
     if (!counters[base]) counters[base] = 1;
     var n = counters[base]++;
-    // Text layers always numbered (text1, text2...)
-    if (base === NAME_TEXT) return base + n;
     // scenebg layers never numbered — always just "scenebg"
     if (base === NAME_PIXEL || base === NAME_SMART) return base;
-    // Other types (stickerbg etc.) numbered only if multiple
+    // All other types (text, stickerbg etc.): numbered only if multiple
     if (totalCounts[base] > 1) return base + n;
     return base;
 }}
