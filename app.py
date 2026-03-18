@@ -363,18 +363,19 @@ function isFrameStyleLayer(layer) {{
     var result = false;
     try {{
         var bounds = layer.bounds;
-        var lx = bounds[0], ty = bounds[1], rx = bounds[2], by = bounds[3];
-        var w  = rx - lx,   h  = by - ty;
+        // Use + to coerce UnitValue objects → plain numbers for reliable arithmetic
+        var lx = +bounds[0], ty = +bounds[1], rx = +bounds[2], by = +bounds[3];
+        var w = rx - lx, h = by - ty;
         if (w < 40 || h < 40) {{ g_frameCache[layer.id] = false; return false; }}
         // Skip small layers (frame layers span most of the canvas)
-        var docArea = g_workDoc.width * g_workDoc.height;
-        if (w * h < docArea * 0.2) {{ g_frameCache[layer.id] = false; return false; }}
+        var docArea = (+g_workDoc.width) * (+g_workDoc.height);
+        if (w * h < docArea * 0.15) {{ g_frameCache[layer.id] = false; return false; }}
         // Duplicate the layer to work on a throwaway copy
         g_workDoc.activeLayer = layer;
         dup = layer.duplicate();
         g_workDoc.activeLayer = dup;
         try {{ dup.rasterize(RasterizeType.ENTIRELAYER); }} catch(e) {{}}
-        // Select center 50% of layer bounds, invert → outer ring selected → delete outer ring
+        // Select center 50% of layer bounds, invert → outer ring selected → clear outer ring
         var inset = 0.25;
         g_workDoc.selection.select(
             [[lx + w*inset, ty + h*inset], [rx - w*inset, ty + h*inset],
@@ -382,13 +383,14 @@ function isFrameStyleLayer(layer) {{
             SelectionType.REPLACE, 0, false
         );
         g_workDoc.selection.invert();
-        // Delete outer ring (makes pixels transparent on a non-background layer)
-        executeAction(charIDToTypeID("Dlt "), new ActionDescriptor(), DialogModes.NO);
+        dup.clear(); // ArtLayer.clear() = Delete key = make selected pixels transparent
         g_workDoc.selection.deselect();
-        // If center had no pixels → bounds will be [0,0,0,0] → it's a frame layer
+        // If center had no pixels → bounds width/height both 0 → it's a frame layer
         var nb = dup.bounds;
-        result = ((nb[2] - nb[0]) == 0 && (nb[3] - nb[1]) == 0);
-        jsxLog("frame check [" + layer.name + "] center-empty=" + result);
+        var nw = +nb[2] - +nb[0];
+        var nh = +nb[3] - +nb[1];
+        result = (nw == 0 && nh == 0);
+        jsxLog("frame check [" + layer.name + "] center-empty=" + result + " nw=" + nw + " nh=" + nh);
     }} catch(e) {{
         jsxLog("frame check err [" + layer.name + "]: " + e.message);
         result = false;
