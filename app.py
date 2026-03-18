@@ -160,7 +160,7 @@ def run():
         if not val:
             return jsonify({"error": f"请填写 {label}"}), 400
 
-    jsx_log_path = "/tmp/psd_renamer_jsx.log"
+    jsx_log_path = os.path.join(output_folder, "psd_renamer_jsx.log")
     try:
         jsx = build_jsx(input_folder, output_folder, type_rules, jsx_log_path)
         jsx_path = os.path.join(os.path.expanduser("~"), ".psd_renamer_tmp.jsx")
@@ -352,25 +352,109 @@ if (!OUTPUT_FOLDER.exists) {{
 function getBaseName(layer) {{
     var k = null;
     try {{ k = layer.kind; }} catch(e) {{}}
-    if (k === K_TEXT   || k === 2)  return NAME_TEXT;
-    if (k === K_SMART  || k === 17) return NAME_SMART;
-    if (k === K_NORMAL || k === 1)  return NAME_PIXEL;
-    // k === K_SHAPE(7), SOLIDFILL(3), GRADIENTFILL(4), PATTERNFILL(5), or null → shape
+    // Compare both numeric value and string representation (PS 2025 may return string)
+    var ks = "" + k;
+    if (k === K_TEXT   || k === 2  || ks === "LayerKind.TEXT")         return NAME_TEXT;
+    if (k === K_SMART  || k === 17 || ks === "LayerKind.SMARTOBJECT")  return NAME_SMART;
+    if (k === K_NORMAL || k === 1  || ks === "LayerKind.NORMAL")       return NAME_PIXEL;
+    // SOLIDFILL(3), GRADIENTFILL(4), PATTERNFILL(5), SHAPE(7), or unknown → shape
     return NAME_SHAPE;
 }}
-// --- Pass 1: count visible layers per base name ---
-function countVisible(layerSet, counts) {{
+// --- Get ACTUAL displayed visibility via Action Manager (includes Layer Comp state) ---
+function getAMVisible(layer) {{
+    try {{
+        var ref = new ActionReference();
+        ref.putIdentifier(charIDToTypeID("Lyr "), layer.id);
+        var desc = executeActionGet(ref);
+        return desc.getBoolean(stringIDToTypeID("visible"));
+    }} catch(e) {{
+        return layer.visible;
+    }}
+}}
+// --- Comprehensive hidden check: any one of these being true means the layer is hidden ---
+function isHidden(layer) {{
+    try {{ if (!layer.visible)     return true; }} catch(e) {{}}
+    try {{ if (!getAMVisible(layer)) return true; }} catch(e) {{}}
+    try {{ if (layer.opacity    === 0) return true; }} catch(e) {{}}
+    try {{ if (layer.fillOpacity === 0) return true; }} catch(e) {{}}
+    return false;
+}}
+// --- Collect hidden layer IDs BEFORE any modifications (preserves original state) ---
+function collectHiddenIds(layerSet, hiddenIds) {{
+    for (var i = 0; i < layerSet.artLayers.length; i++) {{
+        try {{
+            var l = layerSet.artLayers[i];
+            var propVis = l.visible;
+            var amVis   = getAMVisible(l);
+            var opac    = l.opacity;
+            var fillOp  = l.fillOpacity;
+            var hidden  = !propVis || !amVis || opac === 0 || fillOp === 0;
+            jsxLog("check [" + l.name + "] prop=" + propVis + " am=" + amVis +
+                   " opacity=" + opac + " fillOpacity=" + fillOp + " hidden=" + hidden);
+            if (hidden) hiddenIds[l.id] = true;
+        }} catch(e) {{ jsxLog("collectHidden err: " + e.message); }}
+    }}
+    for (var j = 0; j < layerSet.layerSets.length; j++) {{
+        try {{
+            var grp = layerSet.layerSets[j];
+            var grpHidden = !grp.visible || !getAMVisible(grp);
+            if (grpHidden) {{
+                hiddenIds["grp_" + grp.name] = true;
+                jsxLog("check group [" + grp.name + "] hidden=true");
+            }} else {{
+                collectHiddenIds(grp, hiddenIds);
+            }}
+        }} catch(e) {{}}
+    }}
+}}
+// --- Step 1: Unlock ALL layers recursively (must run before delete) ---
+function unlockAll(layerSet) {{
     for (var i = 0; i < layerSet.artLayers.length; i++) {{
         var l = layerSet.artLayers[i];
-        if (!l.visible) continue;
-        var b = getBaseName(l);
+        try {{ if (l.isBackgroundLayer) {{ l.isBackgroundLayer = false; }} }} catch(e) {{}}
+        try {{ l.allLocked = false; }} catch(e) {{ jsxLog("allLocked fail [" + l.name + "]: " + e.message); }}
+        try {{ l.pixelsLocked = false; }} catch(e) {{}}
+        try {{ l.positionLocked = false; }} catch(e) {{}}
+        try {{ l.transparencyLocked = false; }} catch(e) {{}}
+    }}
+    for (var j = 0; j < layerSet.layerSets.length; j++) {{
+        try {{ layerSet.layerSets[j].allLocked = false; }} catch(e) {{}}
+        unlockAll(layerSet.layerSets[j]);
+    }}
+}}
+// --- Step 2: Delete hidden layers using pre-collected IDs (avoids post-unlock state changes) ---
+function deleteHiddenById(layerSet, hiddenIds) {{
+    for (var i = layerSet.artLayers.length - 1; i >= 0; i--) {{
+        try {{
+            var l = layerSet.artLayers[i];
+            if (hiddenIds[l.id]) {{
+                jsxLog("deleting hidden: " + l.name);
+                try {{ l.remove(); }} catch(e) {{ jsxLog("delete fail [" + l.name + "]: " + e.message); }}
+            }}
+        }} catch(e) {{ jsxLog("err delete layer: " + e.message); }}
+    }}
+    for (var j = layerSet.layerSets.length - 1; j >= 0; j--) {{
+        try {{
+            var grp = layerSet.layerSets[j];
+            if (hiddenIds["grp_" + grp.name]) {{
+                jsxLog("deleting hidden group: " + grp.name);
+                try {{ grp.remove(); }} catch(e) {{ jsxLog("delete group fail: " + e.message); }}
+            }} else {{
+                deleteHiddenById(grp, hiddenIds);
+            }}
+        }} catch(e) {{}}
+    }}
+}}
+// --- Step 3: Count remaining visible layers per base name ---
+function countVisible(layerSet, counts) {{
+    for (var i = 0; i < layerSet.artLayers.length; i++) {{
+        var b = getBaseName(layerSet.artLayers[i]);
         counts[b] = (counts[b] || 0) + 1;
     }}
     for (var j = 0; j < layerSet.layerSets.length; j++) {{
-        if (layerSet.layerSets[j].visible) countVisible(layerSet.layerSets[j], counts);
+        countVisible(layerSet.layerSets[j], counts);
     }}
 }}
-// --- Pass 2: rename layer using counts ---
 function renamePSDLayer(layer, counters, totalCounts) {{
     var base = getBaseName(layer);
     if (!counters[base]) counters[base] = 1;
@@ -380,92 +464,99 @@ function renamePSDLayer(layer, counters, totalCounts) {{
     }}
     return base;
 }}
-// (processLayer no longer used — logic is inlined in walkLayers Pass C)
-// --- Walk all layers recursively ---
-// Order: unlock all → delete hidden → rasterize/rename visible (top-to-bottom)
-function walkLayers(layerSet, counters, totalCounts) {{
-    // Pass A: unlock every art layer (each property in its own try-catch so one failure doesn't abort the rest)
-    for (var i = 0; i < layerSet.artLayers.length; i++) {{
-        var l = layerSet.artLayers[i];
-        try {{ if (l.isBackgroundLayer) {{ l.isBackgroundLayer = false; }} }} catch(e) {{}}
-        try {{ l.allLocked = false; }} catch(e) {{ jsxLog("allLocked fail [" + l.name + "]: " + e.message); }}
-        try {{ l.pixelsLocked = false; }} catch(e) {{}}
-        try {{ l.positionLocked = false; }} catch(e) {{}}
-        try {{ l.transparencyLocked = false; }} catch(e) {{}}
-    }}
-    // Pass B: delete hidden art layers (backward to keep indices stable)
-    for (var i = layerSet.artLayers.length - 1; i >= 0; i--) {{
-        var _l = layerSet.artLayers[i];
-        try {{
-            if (!_l.visible) {{
-                jsxLog("deleting hidden: " + _l.name);
-                _l.remove();
-            }}
-        }} catch(e) {{ jsxLog("skip delete [" + _l.name + "]: " + e.message); }}
-    }}
-    // Pass C: rename FIRST (uses original kind), THEN rasterize (top-to-bottom)
+// --- Step 4: Rename then rasterize all remaining layers recursively ---
+function renameLayers(layerSet, counters, totalCounts) {{
     for (var i = 0; i < layerSet.artLayers.length; i++) {{
         try {{
             var layer = layerSet.artLayers[i];
             var lk = null;
             try {{ lk = layer.kind; }} catch(e) {{}}
-            jsxLog("layer [" + layer.name + "] kind=" + lk);
-            // rename using original kind BEFORE rasterize changes kind to NORMAL
+            var lks = "" + lk;
+            var isText = (lk === K_TEXT || lk === 2 || lks === "LayerKind.TEXT");
+            jsxLog("rename [" + layer.name + "] kind=" + lks + " isText=" + isText);
             layer.name = renamePSDLayer(layer, counters, totalCounts);
-            if (lk !== K_TEXT) {{
+            if (!isText) {{
                 try {{ layer.rasterize(RasterizeType.ENTIRELAYER); }} catch(e) {{}}
             }}
-        }} catch(e) {{ jsxLog("skip process: " + e.message); }}
+        }} catch(e) {{ jsxLog("skip rename: " + e.message); }}
     }}
-    // Recurse into layer groups (unlock group, delete if hidden, recurse if visible)
-    for (var j = layerSet.layerSets.length - 1; j >= 0; j--) {{
-        try {{
-            var grp = layerSet.layerSets[j];
-            try {{ grp.allLocked = false; }} catch(e) {{}}
-            if (!grp.visible) {{ try {{ grp.remove(); }} catch(e) {{}} continue; }}
-            walkLayers(grp, counters, totalCounts);
-        }} catch(e) {{ jsxLog("skip group: " + e.message); }}
+    for (var j = 0; j < layerSet.layerSets.length; j++) {{
+        try {{ renameLayers(layerSet.layerSets[j], counters, totalCounts); }} catch(e) {{}}
     }}
 }}
 // --- Process one PSD file ---
 function processPSD(file) {{
-    var doc;
-    jsxLog("Opening: " + file.name);
-    try {{ doc = app.open(file); }} catch(e) {{
-        jsxLog("ERROR opening " + file.name + ": " + e.message);
-        return;
-    }}
-    jsxLog("Opened: " + file.name);
-    var totalCounts = {{}};
-    countVisible(doc, totalCounts);
-    var counters = {{}};
-    walkLayers(doc, counters, totalCounts);
-    var outFile = new File(OUTPUT_FOLDER.fullName + "/" + file.name);
-    jsxLog("Save target: " + outFile.fullName);
-    var opts = new PhotoshopSaveOptions();
-    opts.layers = true;
-    opts.embedColorProfile = true;
-    opts.annotations = false;
-    opts.alphaChannels = true;
-    opts.spotColors = true;
-    var saved = false;
-    try {{
-        // asCopy=true: writes to output folder WITHOUT changing doc's associated path
-        doc.saveAs(outFile, opts, true);
-        jsxLog("Saved OK: " + outFile.fullName);
-        saved = true;
-    }} catch(e) {{
-        jsxLog("saveAs failed (" + e.number + "): " + e.message);
-        // Fallback: try without asCopy flag
+    var doc = null;
+    var wasAlreadyOpen = false;
+    // If the file is already open in Photoshop, use that instance —
+    // it correctly reflects the user's saved hidden state.
+    for (var d = 0; d < app.documents.length; d++) {{
         try {{
-            doc.saveAs(outFile, opts, false);
-            jsxLog("Saved (fallback): " + outFile.fullName);
-            saved = true;
-        }} catch(e2) {{
-            jsxLog("Fallback save also failed: " + e2.message);
+            if (app.documents[d].fullName.toString() === file.fullName.toString()) {{
+                doc = app.documents[d];
+                wasAlreadyOpen = true;
+                jsxLog("Using already-open doc: " + file.name);
+                break;
+            }}
+        }} catch(e) {{}}
+    }}
+    if (!doc) {{
+        jsxLog("Opening: " + file.name);
+        try {{ doc = app.open(file); }} catch(e) {{
+            jsxLog("ERROR opening " + file.name + ": " + e.message);
+            return;
         }}
     }}
-    doc.close(SaveOptions.DONOTSAVECHANGES);
+    jsxLog("Opened: " + file.name);
+    // Duplicate so we never modify the user's session document
+    var workDoc = doc;
+    if (wasAlreadyOpen) {{
+        try {{
+            workDoc = doc.duplicate(file.name, false);
+            jsxLog("Duplicated for processing");
+        }} catch(e) {{
+            jsxLog("Dup fail: " + e.message);
+            workDoc = doc;
+            wasAlreadyOpen = false;
+        }}
+    }}
+    try {{
+        // STEP 1: Capture hidden state BEFORE any modifications (most accurate)
+        var hiddenIds = {{}};
+        collectHiddenIds(workDoc, hiddenIds);
+        // STEP 2: Unlock all layers (must happen before delete to avoid error 8800)
+        unlockAll(workDoc);
+        jsxLog("Unlocked all layers");
+        // STEP 3: Delete layers that were hidden at capture time
+        deleteHiddenById(workDoc, hiddenIds);
+        jsxLog("Deleted hidden layers");
+        var totalCounts = {{}};
+        countVisible(workDoc, totalCounts);
+        var counters = {{}};
+        renameLayers(workDoc, counters, totalCounts);
+        var outFile = new File(OUTPUT_FOLDER.fullName + "/" + file.name);
+        jsxLog("Save target: " + outFile.fullName);
+        var opts = new PhotoshopSaveOptions();
+        opts.layers = true;
+        opts.embedColorProfile = true;
+        opts.annotations = false;
+        opts.alphaChannels = true;
+        opts.spotColors = true;
+        try {{
+            workDoc.saveAs(outFile, opts, true);
+            jsxLog("Saved OK: " + outFile.fullName);
+        }} catch(e) {{
+            jsxLog("saveAs failed (" + e.number + "): " + e.message);
+            try {{
+                workDoc.saveAs(outFile, opts, false);
+                jsxLog("Saved (fallback): " + outFile.fullName);
+            }} catch(e2) {{
+                jsxLog("Fallback save also failed: " + e2.message);
+            }}
+        }}
+    }} finally {{
+        try {{ workDoc.close(SaveOptions.DONOTSAVECHANGES); jsxLog("Closed: " + file.name); }} catch(e) {{}}
+    }}
 }}
 // --- Main ---
 var psdFiles = INPUT_FOLDER.getFiles(/\\.psd$/i);
