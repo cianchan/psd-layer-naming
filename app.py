@@ -391,7 +391,23 @@ function collectHiddenIds(layerSet, hiddenIds) {{
             var hidden  = !propVis || !amVis || opac === 0 || fillOp === 0;
             jsxLog("check [" + l.name + "] prop=" + propVis + " am=" + amVis +
                    " opacity=" + opac + " fillOpacity=" + fillOp + " hidden=" + hidden);
-            if (hidden) hiddenIds[l.id] = true;
+            if (hidden) {{ hiddenIds[l.id] = true; continue; }}
+            // Also delete completely empty pixel layers (bounds width+height = 0)
+            try {{
+                var lk = null;
+                try {{ lk = l.kind; }} catch(e) {{}}
+                var lks = "" + lk;
+                var isText = (lk === K_TEXT || lk === 2 || lks === "LayerKind.TEXT");
+                if (!isText) {{
+                    var b = l.bounds;
+                    var w = b[2] - b[0];
+                    var h = b[3] - b[1];
+                    if (w == 0 && h == 0) {{
+                        jsxLog("check [" + l.name + "] empty (no pixels) → delete");
+                        hiddenIds[l.id] = true;
+                    }}
+                }}
+            }} catch(e) {{}}
         }} catch(e) {{ jsxLog("collectHidden err: " + e.message); }}
     }}
     for (var j = 0; j < layerSet.layerSets.length; j++) {{
