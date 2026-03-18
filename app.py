@@ -726,14 +726,8 @@ if (!psdFiles || psdFiles.length === 0) {{
     return jsx
 # ── Entry ─────────────────────────────────────────────────────
 if __name__ == "__main__":
-    import socket
-    try:
-        lan_ip = socket.gethostbyname(socket.gethostname())
-    except Exception:
-        lan_ip = "127.0.0.1"
     print("=" * 60)
     print("  PSD 图层重命名工具")
-    print(f"  本机访问:   http://127.0.0.1:7861")
-    print(f"  局域网访问: http://{lan_ip}:7861")
+    print("  访问: http://127.0.0.1:7861")
     print("=" * 60)
-    app.run(host="0.0.0.0", port=7861, debug=False, use_reloader=True)
+    app.run(host="127.0.0.1", port=7861, debug=False, use_reloader=True)
