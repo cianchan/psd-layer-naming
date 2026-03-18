@@ -515,6 +515,29 @@ function unlockAll(layerSet) {{
         unlockAll(layerSet.layerSets[j]);
     }}
 }}
+// --- Ungroup one layer set: move all its contents to its parent, then delete it ---
+function ungroupLayerSet(grp) {{
+    jsxLog("ungrouping: " + grp.name);
+    // Recursively dissolve any nested sub-groups first
+    while (grp.layerSets.length > 0) {{
+        ungroupLayerSet(grp.layerSets[0]);
+    }}
+    // Move each top-most layer before this group (preserves top-to-bottom order)
+    while (grp.artLayers.length > 0) {{
+        try {{ grp.artLayers[0].move(grp, ElementPlacement.PLACEBEFORE); }} catch(e) {{ break; }}
+    }}
+    // Delete the now-empty group
+    try {{ grp.remove(); }} catch(e) {{ jsxLog("ungroup remove err [" + grp.name + "]: " + e.message); }}
+}}
+// --- Dissolve all layer groups in the document (called with workDoc) ---
+function ungroupAll(layerSet) {{
+    // Snapshot first: moving layers modifies the live layerSets collection
+    var groups = [];
+    for (var j = 0; j < layerSet.layerSets.length; j++) {{ groups.push(layerSet.layerSets[j]); }}
+    for (var k = 0; k < groups.length; k++) {{
+        try {{ ungroupLayerSet(groups[k]); }} catch(e) {{ jsxLog("ungroupAll err: " + e.message); }}
+    }}
+}}
 // --- Step 2: Delete hidden layers using pre-collected IDs (avoids post-unlock state changes) ---
 function deleteHiddenById(layerSet, hiddenIds) {{
     for (var i = layerSet.artLayers.length - 1; i >= 0; i--) {{
@@ -650,7 +673,10 @@ function processPSD(file) {{
         // STEP 3.5: Apply all layer masks (must run after unlockAll)
         applyAllMasks(workDoc);
         jsxLog("Applied all masks");
-        // STEP 3.6: Skip PSD if no text layers remain after deletion
+        // STEP 3.6: Dissolve all layer groups (ungroup)
+        ungroupAll(workDoc);
+        jsxLog("Ungrouped all groups");
+        // STEP 3.7: Skip PSD if no text layers remain after deletion
         if (!hasTextLayers(workDoc)) {{
             jsxLog("Skipped (no text layers): " + file.name);
             return;
