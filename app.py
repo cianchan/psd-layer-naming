@@ -546,6 +546,21 @@ function deleteHiddenById(layerSet, hiddenIds) {{
         }} catch(e) {{}}
     }}
 }}
+// --- Check if a document contains at least one text layer ---
+function hasTextLayers(layerSet) {{
+    for (var i = 0; i < layerSet.artLayers.length; i++) {{
+        try {{
+            var lk = null;
+            try {{ lk = layerSet.artLayers[i].kind; }} catch(e) {{}}
+            var lks = "" + lk;
+            if (lk === K_TEXT || lk === 2 || lks === "LayerKind.TEXT") return true;
+        }} catch(e) {{}}
+    }}
+    for (var j = 0; j < layerSet.layerSets.length; j++) {{
+        try {{ if (hasTextLayers(layerSet.layerSets[j])) return true; }} catch(e) {{}}
+    }}
+    return false;
+}}
 // --- Step 3: Count remaining visible layers per base name ---
 function countVisible(layerSet, counts) {{
     for (var i = 0; i < layerSet.artLayers.length; i++) {{
@@ -635,6 +650,11 @@ function processPSD(file) {{
         // STEP 3.5: Apply all layer masks (must run after unlockAll)
         applyAllMasks(workDoc);
         jsxLog("Applied all masks");
+        // STEP 3.6: Skip PSD if no text layers remain after deletion
+        if (!hasTextLayers(workDoc)) {{
+            jsxLog("Skipped (no text layers): " + file.name);
+            return;
+        }}
         // Set global doc reference for isFrameStyleLayer + reset per-PSD cache
         g_workDoc   = workDoc;
         g_frameCache = {{}};
