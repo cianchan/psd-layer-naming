@@ -459,9 +459,12 @@ function renamePSDLayer(layer, counters, totalCounts) {{
     var base = getBaseName(layer);
     if (!counters[base]) counters[base] = 1;
     var n = counters[base]++;
-    if (base === NAME_TEXT || totalCounts[base] > 1) {{
-        return base + n;
-    }}
+    // Text layers always numbered (text1, text2...)
+    if (base === NAME_TEXT) return base + n;
+    // scenebg layers never numbered — always just "scenebg"
+    if (base === NAME_PIXEL || base === NAME_SMART) return base;
+    // Other types (stickerbg etc.) numbered only if multiple
+    if (totalCounts[base] > 1) return base + n;
     return base;
 }}
 // --- Step 4: Rename then rasterize all remaining layers recursively ---
