@@ -314,9 +314,6 @@ def build_jsx(input_folder, output_folder, type_rules, jsx_log_path="/tmp/psd_re
     name_smart = type_rules.get("smart", "scenebg")
     name_shape = type_rules.get("shape", "stickerbg")
     name_frame = type_rules.get("frame", "frame")
-    # Keywords in original layer name that identify a frame/border layer (case-insensitive)
-    frame_kw_list = type_rules.get("frame_keywords", ["frame", "border", "边框", "框"])
-    frame_kw_js = json.dumps([k.lower() for k in frame_kw_list])
     input_folder_js  = input_folder.replace("\\", "/")
     output_folder_js = output_folder.replace("\\", "/")
     log_path_js = jsx_log_path.replace("\\", "/")
@@ -328,7 +325,8 @@ var NAME_PIXEL = "{name_pixel}";
 var NAME_SMART = "{name_smart}";
 var NAME_SHAPE = "{name_shape}";
 var NAME_FRAME = "{name_frame}";
-var FRAME_KEYWORDS = {frame_kw_js}; // original-name keywords that identify frame/border layers
+var g_workDoc   = null;  // set per-PSD in processPSD before countVisible
+var g_frameCache = {{}};  // layerId → bool, cache per PSD to avoid duplicate detection work
 var INPUT_FOLDER  = new Folder("{input_folder_js}");
 var OUTPUT_FOLDER = new Folder("{output_folder_js}");
 var LOG_FILE = new File("{log_path_js}");
@@ -354,28 +352,64 @@ if (!OUTPUT_FOLDER.exists) {{
     OUTPUT_FOLDER.create();
     jsxLog("Created output folder");
 }}
-// --- Check if layer's original name matches frame keywords ---
-function isFrameLayer(layer) {{
+// --- Visual frame detection: check if the inner 50% of the layer bounds is transparent ---
+// Creates a temporary duplicate so the original layer is never modified.
+// Only runs on non-text layers whose bounds cover ≥20% of the document area.
+function isFrameStyleLayer(layer) {{
+    if (!g_workDoc) return false;
+    // Return cached result (detection is expensive — only run once per layer per PSD)
+    if (g_frameCache.hasOwnProperty(layer.id)) return g_frameCache[layer.id];
+    var dup = null;
+    var result = false;
     try {{
-        var n = layer.name.toLowerCase();
-        for (var fi = 0; fi < FRAME_KEYWORDS.length; fi++) {{
-            if (n.indexOf(FRAME_KEYWORDS[fi]) !== -1) return true;
-        }}
-    }} catch(e) {{}}
-    return false;
+        var bounds = layer.bounds;
+        var lx = bounds[0], ty = bounds[1], rx = bounds[2], by = bounds[3];
+        var w  = rx - lx,   h  = by - ty;
+        if (w < 40 || h < 40) {{ g_frameCache[layer.id] = false; return false; }}
+        // Skip small layers (frame layers span most of the canvas)
+        var docArea = g_workDoc.width * g_workDoc.height;
+        if (w * h < docArea * 0.2) {{ g_frameCache[layer.id] = false; return false; }}
+        // Duplicate the layer to work on a throwaway copy
+        g_workDoc.activeLayer = layer;
+        dup = layer.duplicate();
+        g_workDoc.activeLayer = dup;
+        try {{ dup.rasterize(RasterizeType.ENTIRELAYER); }} catch(e) {{}}
+        // Select center 50% of layer bounds, invert → outer ring selected → delete outer ring
+        var inset = 0.25;
+        g_workDoc.selection.select(
+            [[lx + w*inset, ty + h*inset], [rx - w*inset, ty + h*inset],
+             [rx - w*inset, by - h*inset], [lx + w*inset, by - h*inset]],
+            SelectionType.REPLACE, 0, false
+        );
+        g_workDoc.selection.invert();
+        // Delete outer ring (makes pixels transparent on a non-background layer)
+        executeAction(charIDToTypeID("Dlt "), new ActionDescriptor(), DialogModes.NO);
+        g_workDoc.selection.deselect();
+        // If center had no pixels → bounds will be [0,0,0,0] → it's a frame layer
+        var nb = dup.bounds;
+        result = ((nb[2] - nb[0]) == 0 && (nb[3] - nb[1]) == 0);
+        jsxLog("frame check [" + layer.name + "] center-empty=" + result);
+    }} catch(e) {{
+        jsxLog("frame check err [" + layer.name + "]: " + e.message);
+        result = false;
+    }} finally {{
+        if (dup) {{ try {{ dup.remove(); }} catch(e2) {{}} dup = null; }}
+        try {{ g_workDoc.selection.deselect(); }} catch(e2) {{}}
+    }}
+    g_frameCache[layer.id] = result;
+    return result;
 }}
-// --- Get base name by layer type (frame detection takes priority over type) ---
+// --- Get base name by layer type (visual frame check takes priority over type) ---
 function getBaseName(layer) {{
     var k = null;
     try {{ k = layer.kind; }} catch(e) {{}}
-    // Compare both numeric value and string representation (PS 2025 may return string)
     var ks = "" + k;
-    // Text layers are always "text" regardless of name
-    if (k === K_TEXT   || k === 2  || ks === "LayerKind.TEXT")         return NAME_TEXT;
-    // Frame/border layers detected by original name keywords (before type-based check)
-    if (isFrameLayer(layer)) return NAME_FRAME;
-    if (k === K_SMART  || k === 17 || ks === "LayerKind.SMARTOBJECT")  return NAME_SMART;
-    if (k === K_NORMAL || k === 1  || ks === "LayerKind.NORMAL")       return NAME_PIXEL;
+    // Text layers are always "text"
+    if (k === K_TEXT   || k === 2  || ks === "LayerKind.TEXT")        return NAME_TEXT;
+    // Visual frame detection: hollow-center layers → "frame"
+    if (isFrameStyleLayer(layer))                                      return NAME_FRAME;
+    if (k === K_SMART  || k === 17 || ks === "LayerKind.SMARTOBJECT") return NAME_SMART;
+    if (k === K_NORMAL || k === 1  || ks === "LayerKind.NORMAL")      return NAME_PIXEL;
     // SOLIDFILL(3), GRADIENTFILL(4), PATTERNFILL(5), SHAPE(7), or unknown → shape
     return NAME_SHAPE;
 }}
@@ -601,6 +635,9 @@ function processPSD(file) {{
         // STEP 3.5: Apply all layer masks (must run after unlockAll)
         applyAllMasks(workDoc);
         jsxLog("Applied all masks");
+        // Set global doc reference for isFrameStyleLayer + reset per-PSD cache
+        g_workDoc   = workDoc;
+        g_frameCache = {{}};
         var totalCounts = {{}};
         countVisible(workDoc, totalCounts);
         var counters = {{}};
