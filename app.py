@@ -313,6 +313,10 @@ def build_jsx(input_folder, output_folder, type_rules, jsx_log_path="/tmp/psd_re
     name_pixel = type_rules.get("pixel", "scenebg")
     name_smart = type_rules.get("smart", "scenebg")
     name_shape = type_rules.get("shape", "stickerbg")
+    name_frame = type_rules.get("frame", "frame")
+    # Keywords in original layer name that identify a frame/border layer (case-insensitive)
+    frame_kw_list = type_rules.get("frame_keywords", ["frame", "border", "边框", "框"])
+    frame_kw_js = json.dumps([k.lower() for k in frame_kw_list])
     input_folder_js  = input_folder.replace("\\", "/")
     output_folder_js = output_folder.replace("\\", "/")
     log_path_js = jsx_log_path.replace("\\", "/")
@@ -323,6 +327,8 @@ var NAME_TEXT  = "text";
 var NAME_PIXEL = "{name_pixel}";
 var NAME_SMART = "{name_smart}";
 var NAME_SHAPE = "{name_shape}";
+var NAME_FRAME = "{name_frame}";
+var FRAME_KEYWORDS = {frame_kw_js}; // original-name keywords that identify frame/border layers
 var INPUT_FOLDER  = new Folder("{input_folder_js}");
 var OUTPUT_FOLDER = new Folder("{output_folder_js}");
 var LOG_FILE = new File("{log_path_js}");
@@ -348,13 +354,26 @@ if (!OUTPUT_FOLDER.exists) {{
     OUTPUT_FOLDER.create();
     jsxLog("Created output folder");
 }}
-// --- Get base name by layer type ---
+// --- Check if layer's original name matches frame keywords ---
+function isFrameLayer(layer) {{
+    try {{
+        var n = layer.name.toLowerCase();
+        for (var fi = 0; fi < FRAME_KEYWORDS.length; fi++) {{
+            if (n.indexOf(FRAME_KEYWORDS[fi]) !== -1) return true;
+        }}
+    }} catch(e) {{}}
+    return false;
+}}
+// --- Get base name by layer type (frame detection takes priority over type) ---
 function getBaseName(layer) {{
     var k = null;
     try {{ k = layer.kind; }} catch(e) {{}}
     // Compare both numeric value and string representation (PS 2025 may return string)
     var ks = "" + k;
+    // Text layers are always "text" regardless of name
     if (k === K_TEXT   || k === 2  || ks === "LayerKind.TEXT")         return NAME_TEXT;
+    // Frame/border layers detected by original name keywords (before type-based check)
+    if (isFrameLayer(layer)) return NAME_FRAME;
     if (k === K_SMART  || k === 17 || ks === "LayerKind.SMARTOBJECT")  return NAME_SMART;
     if (k === K_NORMAL || k === 1  || ks === "LayerKind.NORMAL")       return NAME_PIXEL;
     // SOLIDFILL(3), GRADIENTFILL(4), PATTERNFILL(5), SHAPE(7), or unknown → shape
