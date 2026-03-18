@@ -423,6 +423,38 @@ function collectHiddenIds(layerSet, hiddenIds) {{
         }} catch(e) {{}}
     }}
 }}
+// --- Check if layer has a pixel mask ---
+function hasMask(layer) {{
+    try {{
+        var ref = new ActionReference();
+        ref.putIdentifier(charIDToTypeID("Lyr "), layer.id);
+        var desc = executeActionGet(ref);
+        return desc.hasKey(stringIDToTypeID("userMaskEnabled"));
+    }} catch(e) {{ return false; }}
+}}
+// --- Apply all masks recursively (must run after unlockAll) ---
+function applyAllMasks(layerSet) {{
+    for (var i = layerSet.artLayers.length - 1; i >= 0; i--) {{
+        try {{
+            var l = layerSet.artLayers[i];
+            if (hasMask(l)) {{
+                app.activeDocument.activeLayer = l;
+                var desc = new ActionDescriptor();
+                var ref  = new ActionReference();
+                ref.putEnumerated(charIDToTypeID("Chnl"),
+                                  charIDToTypeID("Chnl"),
+                                  charIDToTypeID("Msk "));
+                desc.putReference(charIDToTypeID("null"), ref);
+                desc.putBoolean(charIDToTypeID("Aply"), true);
+                executeAction(charIDToTypeID("Dlt "), desc, DialogModes.NO);
+                jsxLog("Applied mask: " + l.name);
+            }}
+        }} catch(e) {{ jsxLog("mask err [" + l.name + "]: " + e.message); }}
+    }}
+    for (var j = 0; j < layerSet.layerSets.length; j++) {{
+        try {{ applyAllMasks(layerSet.layerSets[j]); }} catch(e) {{}}
+    }}
+}}
 // --- Step 1: Unlock ALL layers recursively (must run before delete) ---
 function unlockAll(layerSet) {{
     for (var i = 0; i < layerSet.artLayers.length; i++) {{
@@ -547,6 +579,9 @@ function processPSD(file) {{
         // STEP 3: Delete layers that were hidden at capture time
         deleteHiddenById(workDoc, hiddenIds);
         jsxLog("Deleted hidden layers");
+        // STEP 3.5: Apply all layer masks (must run after unlockAll)
+        applyAllMasks(workDoc);
+        jsxLog("Applied all masks");
         var totalCounts = {{}};
         countVisible(workDoc, totalCounts);
         var counters = {{}};
