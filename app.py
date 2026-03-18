@@ -352,51 +352,35 @@ if (!OUTPUT_FOLDER.exists) {{
     OUTPUT_FOLDER.create();
     jsxLog("Created output folder");
 }}
-// --- Visual frame detection: check if the inner 50% of the layer bounds is transparent ---
-// Creates a temporary duplicate so the original layer is never modified.
-// Only runs on non-text layers whose bounds cover ≥20% of the document area.
+// --- Visual frame detection: shape/fill layer that wraps all 4 edges of the canvas ---
+// A "frame" layer is any non-text / non-smart-object / non-pixel layer whose bounding
+// box covers ≥ 80% of both the document width AND height (e.g. a green rectangle border).
+// This avoids the false positives that pixel-manipulation approaches produce on smart objects
+// and the false negatives caused by SOLIDFILL layers that fill their entire rectangle.
 function isFrameStyleLayer(layer) {{
     if (!g_workDoc) return false;
-    // Return cached result (detection is expensive — only run once per layer per PSD)
     if (g_frameCache.hasOwnProperty(layer.id)) return g_frameCache[layer.id];
-    var dup = null;
     var result = false;
     try {{
+        // Frame candidates are shape/fill layers only — skip text, smart objects, pixel layers
+        var k = null;
+        try {{ k = layer.kind; }} catch(e) {{}}
+        var ks = "" + k;
+        var isText   = (k === K_TEXT   || k === 2  || ks === "LayerKind.TEXT");
+        var isSmart  = (k === K_SMART  || k === 17 || ks === "LayerKind.SMARTOBJECT");
+        var isPixel  = (k === K_NORMAL || k === 1  || ks === "LayerKind.NORMAL");
+        if (isText || isSmart || isPixel) {{ g_frameCache[layer.id] = false; return false; }}
+        // The layer's bounds must cover ≥ 80% of both document dimensions
         var bounds = layer.bounds;
-        // Use + to coerce UnitValue objects → plain numbers for reliable arithmetic
         var lx = +bounds[0], ty = +bounds[1], rx = +bounds[2], by = +bounds[3];
         var w = rx - lx, h = by - ty;
-        if (w < 40 || h < 40) {{ g_frameCache[layer.id] = false; return false; }}
-        // Skip small layers (frame layers span most of the canvas)
-        var docArea = (+g_workDoc.width) * (+g_workDoc.height);
-        if (w * h < docArea * 0.15) {{ g_frameCache[layer.id] = false; return false; }}
-        // Duplicate the layer to work on a throwaway copy
-        g_workDoc.activeLayer = layer;
-        dup = layer.duplicate();
-        g_workDoc.activeLayer = dup;
-        try {{ dup.rasterize(RasterizeType.ENTIRELAYER); }} catch(e) {{}}
-        // Select center 50% of layer bounds, invert → outer ring selected → clear outer ring
-        var inset = 0.25;
-        g_workDoc.selection.select(
-            [[lx + w*inset, ty + h*inset], [rx - w*inset, ty + h*inset],
-             [rx - w*inset, by - h*inset], [lx + w*inset, by - h*inset]],
-            SelectionType.REPLACE, 0, false
-        );
-        g_workDoc.selection.invert();
-        dup.clear(); // ArtLayer.clear() = Delete key = make selected pixels transparent
-        g_workDoc.selection.deselect();
-        // If center had no pixels → bounds width/height both 0 → it's a frame layer
-        var nb = dup.bounds;
-        var nw = +nb[2] - +nb[0];
-        var nh = +nb[3] - +nb[1];
-        result = (nw == 0 && nh == 0);
-        jsxLog("frame check [" + layer.name + "] center-empty=" + result + " nw=" + nw + " nh=" + nh);
+        var docW = +g_workDoc.width, docH = +g_workDoc.height;
+        result = (w >= docW * 0.8 && h >= docH * 0.8);
+        jsxLog("frame check [" + layer.name + "] w=" + Math.round(w) + "/" + Math.round(docW) +
+               " h=" + Math.round(h) + "/" + Math.round(docH) + " → " + result);
     }} catch(e) {{
         jsxLog("frame check err [" + layer.name + "]: " + e.message);
         result = false;
-    }} finally {{
-        if (dup) {{ try {{ dup.remove(); }} catch(e2) {{}} dup = null; }}
-        try {{ g_workDoc.selection.deselect(); }} catch(e2) {{}}
     }}
     g_frameCache[layer.id] = result;
     return result;
@@ -487,23 +471,29 @@ function hasMask(layer) {{
         return desc.hasKey(stringIDToTypeID("userMaskEnabled"));
     }} catch(e) {{ return false; }}
 }}
-// --- Apply all masks recursively (must run after unlockAll) ---
+// --- Helper: apply pixel mask on the currently-active layer ---
+function applyMaskAction() {{
+    var desc = new ActionDescriptor();
+    var ref  = new ActionReference();
+    ref.putEnumerated(charIDToTypeID("Chnl"), charIDToTypeID("Chnl"), charIDToTypeID("Msk "));
+    desc.putReference(charIDToTypeID("null"), ref);
+    desc.putBoolean(charIDToTypeID("Aply"), true);
+    executeAction(charIDToTypeID("Dlt "), desc, DialogModes.NO);
+}}
+// --- Apply all masks on pixel layers; non-pixel layers are handled during rasterization ---
 function applyAllMasks(layerSet) {{
     for (var i = layerSet.artLayers.length - 1; i >= 0; i--) {{
         try {{
             var l = layerSet.artLayers[i];
-            if (hasMask(l)) {{
-                app.activeDocument.activeLayer = l;
-                var desc = new ActionDescriptor();
-                var ref  = new ActionReference();
-                ref.putEnumerated(charIDToTypeID("Chnl"),
-                                  charIDToTypeID("Chnl"),
-                                  charIDToTypeID("Msk "));
-                desc.putReference(charIDToTypeID("null"), ref);
-                desc.putBoolean(charIDToTypeID("Aply"), true);
-                executeAction(charIDToTypeID("Dlt "), desc, DialogModes.NO);
-                jsxLog("Applied mask: " + l.name);
-            }}
+            if (!hasMask(l)) continue;
+            var lk = null;
+            try {{ lk = l.kind; }} catch(e) {{}}
+            var lks = "" + lk;
+            var isPixel = (lk === K_NORMAL || lk === 1 || lks === "LayerKind.NORMAL");
+            if (!isPixel) continue; // SOLIDFILL / shape layers — mask applied after rasterize
+            app.activeDocument.activeLayer = l;
+            applyMaskAction();
+            jsxLog("Applied mask: " + l.name);
         }} catch(e) {{ jsxLog("mask err [" + l.name + "]: " + e.message); }}
     }}
     for (var j = 0; j < layerSet.layerSets.length; j++) {{
@@ -596,6 +586,14 @@ function renameLayers(layerSet, counters, totalCounts) {{
             layer.name = renamePSDLayer(layer, counters, totalCounts);
             if (!isText) {{
                 try {{ layer.rasterize(RasterizeType.ENTIRELAYER); }} catch(e) {{}}
+                // After rasterizing, apply any remaining mask (SOLIDFILL/shape masks)
+                try {{
+                    if (hasMask(layer)) {{
+                        app.activeDocument.activeLayer = layer;
+                        applyMaskAction();
+                        jsxLog("Applied mask after rasterize: " + layer.name);
+                    }}
+                }} catch(me) {{ jsxLog("post-rasterize mask err [" + layer.name + "]: " + me.message); }}
             }}
         }} catch(e) {{ jsxLog("skip rename: " + e.message); }}
     }}
