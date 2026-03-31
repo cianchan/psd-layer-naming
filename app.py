@@ -545,23 +545,43 @@ function ungroupAll(layerSet) {{
     }}
 }}
 // --- Merge all clipping mask layers into their base layer ---
-// A clipping mask layer has layer.grouped === true. We merge it downward
-// (into the layer immediately below) repeatedly until no grouped layers remain.
+// Iterates top→bottom; when a grouped (clipping mask) layer is found, first
+// rasterizes the layer directly below it (in case it's a SOLIDFILL/SHAPE so
+// merge() won't error), then merges down. Repeats until no grouped layers remain.
 function flattenClippingMasks(doc) {{
     var changed = true;
-    while (changed) {{
+    var maxIter = 300; // safety cap
+    while (changed && maxIter-- > 0) {{
         changed = false;
         var layers = doc.artLayers;
         for (var i = 0; i < layers.length; i++) {{
             try {{
-                if (layers[i].grouped) {{
-                    jsxLog("Merging clipping mask: " + layers[i].name);
-                    doc.activeLayer = layers[i];
-                    layers[i].merge();
-                    changed = true;
-                    break; // layer collection changed — restart scan
+                if (!layers[i].grouped) continue;
+                // Rasterize the merge target (layer below) if it is not already
+                // a pixel layer — merging pixel into SOLIDFILL/SHAPE fails otherwise.
+                if (i + 1 < layers.length) {{
+                    var below = layers[i + 1];
+                    var bk = null;
+                    try {{ bk = below.kind; }} catch(e2) {{}}
+                    var bks = "" + bk;
+                    var belowIsPixel = (bk === K_NORMAL || bk === 1 || bks === "LayerKind.NORMAL");
+                    if (!belowIsPixel) {{
+                        try {{
+                            doc.activeLayer = below;
+                            below.rasterize(RasterizeType.ENTIRELAYER);
+                            jsxLog("Rasterized merge target: " + below.name);
+                        }} catch(re) {{ jsxLog("Rasterize target err [" + below.name + "]: " + re.message); }}
+                    }}
                 }}
-            }} catch(e) {{ jsxLog("clipping merge err [" + layers[i].name + "]: " + e.message); break; }}
+                jsxLog("Merging clipping mask: " + layers[i].name);
+                doc.activeLayer = layers[i];
+                layers[i].merge();
+                changed = true;
+                break; // layer collection changed — restart scan
+            }} catch(e) {{
+                jsxLog("clipping merge err [" + layers[i].name + "]: " + e.message);
+                // Don't break — continue scanning for other grouped layers
+            }}
         }}
     }}
 }}
