@@ -72,9 +72,9 @@
           </div>
         </div>
 
-        <!-- Product category inputs (required for auto product detection) -->
+        <!-- Product category inputs (optional, improves detection accuracy) -->
         <div class="pt-1 border-t border-gray-100">
-          <label class="block text-sm text-gray-600 mb-2">商品品类 <span class="text-red-400">*</span> <span class="text-xs text-gray-400 font-normal">（用于自动识别商品主体图层，需 Shopee VPN）</span></label>
+          <label class="block text-sm text-gray-600 mb-2">商品品类 <span class="text-xs text-gray-400 font-normal">（可选，填写后识别更准确，需 Shopee VPN）</span></label>
           <div class="flex gap-3">
             <div class="flex-1">
               <input id="seg-level1" type="text" placeholder="Level1 品类，如 Electronics" oninput="save()"
@@ -268,9 +268,6 @@
 
       if (!inputFolder)  { showErr("run-error", "请填写 PSD 输入文件夹"); return; }
       if (!outputFolder) { showErr("run-error", "请填写 PSD 输出文件夹"); return; }
-      if (!segLevel1)    { showErr("run-error", "请填写 Level1 品类"); return; }
-      if (!segLevel3)    { showErr("run-error", "请填写 Level3 品类"); return; }
-
       setRunning(true);
       try {
         const res = await fetch("/api/run", {

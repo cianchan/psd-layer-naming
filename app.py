@@ -158,10 +158,10 @@ def run():
         "pixel": "scenebg", "smart": "scenebg", "shape": "stickerbg"
     })
 
-    for label, val in [("输入文件夹", input_folder), ("输出文件夹", output_folder),
-                       ("Level1 品类", level1_cat), ("Level3 品类", level3_cat)]:
+    for label, val in [("输入文件夹", input_folder), ("输出文件夹", output_folder)]:
         if not val:
             return jsonify({"error": f"请填写 {label}"}), 400
+    # Categories are optional — empty strings let the API use its generic model
 
     # Store categories for use in _watch thread
     job_state["level1_cat"] = level1_cat
