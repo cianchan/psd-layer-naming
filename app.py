@@ -151,14 +151,22 @@ def run():
     data = request.json
     input_folder  = data.get("input_folder", "").strip()
     output_folder = data.get("output_folder", "").strip()
+    level1_cat    = data.get("level1_cat", "").strip()
+    level3_cat    = data.get("level3_cat", "").strip()
     # type_rules: {pixel, smart, shape} → name strings
     type_rules = data.get("type_rules", {
         "pixel": "scenebg", "smart": "scenebg", "shape": "stickerbg"
     })
 
-    for label, val in [("输入文件夹", input_folder), ("输出文件夹", output_folder)]:
+    for label, val in [("输入文件夹", input_folder), ("输出文件夹", output_folder),
+                       ("Level1 品类", level1_cat), ("Level3 品类", level3_cat)]:
         if not val:
             return jsonify({"error": f"请填写 {label}"}), 400
+
+    # Store categories for use in _watch thread
+    job_state["level1_cat"] = level1_cat
+    job_state["level3_cat"] = level3_cat
+    job_state["output_folder"] = output_folder
 
     jsx_log_path = os.path.join(output_folder, "psd_renamer_jsx.log")
     stop_flag_path = os.path.join(output_folder, "psd_renamer_stop.flag")
@@ -171,9 +179,6 @@ def run():
         Path(jsx_log_path).write_text("", encoding="utf-8")  # clear previous log
         log(f"📄 JSX: {jsx_path}")
 
-        # Pass a short JS loader string — reads and evals the JSX file from within Photoshop.
-        # Must use the EXACT installed app name so osascript loads Photoshop's dictionary;
-        # without the dictionary, "do javascript" is unrecognized and causes a parse error.
         jsx_loader = (
             f"var _f=new File('{jsx_path}');"
             "_f.open('r');var _s=_f.read();_f.close();eval(_s);"
@@ -194,7 +199,7 @@ def run():
         job_state["running"] = True
         log("🚀 Photoshop 已启动，正在执行脚本…")
 
-        def _watch(proc):
+        def _watch(proc, out_folder, lvl1, lvl3):
             # Poll log file for real-time updates while script runs
             last_size = 0
             while proc.poll() is None:
@@ -222,9 +227,31 @@ def run():
                 err = stderr.decode().strip()
                 if err:
                     log(f"❌ 错误: {err}")
-            job_state["running"] = False
             log("✅ Photoshop 处理完成")
-        threading.Thread(target=_watch, args=(ps_process,), daemon=True).start()
+
+            # ── 自动识别商品主体图层 ──────────────────────────────
+            log(f"🔍 开始识别商品主体图层（{lvl1} / {lvl3}）…")
+            try:
+                import seg_product
+                summary = seg_product.process_output_folder(
+                    out_folder, lvl1, lvl3,
+                    auto_rename=True,
+                    log_fn=log
+                )
+                if summary:
+                    log(f"✅ 商品主体识别完成，共处理 {len(summary)} 个 PSD")
+                else:
+                    log("⚠️ 未能识别商品主体（请检查 Shopee VPN 是否连接）")
+            except Exception as e:
+                log(f"❌ 商品主体识别出错: {e}")
+
+            job_state["running"] = False
+
+        threading.Thread(
+            target=_watch,
+            args=(ps_process, output_folder, level1_cat, level3_cat),
+            daemon=True
+        ).start()
 
         return jsonify({"ok": True})
     except Exception as e:
