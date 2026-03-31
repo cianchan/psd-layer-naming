@@ -256,6 +256,55 @@ def status():
         "total": job_state["total"],
         "current_file": job_state["current_file"]
     })
+
+@app.route("/api/identify_products", methods=["POST"])
+def identify_products():
+    """
+    Post-process: run Shopee segmentation API on all 'scenebg' layers in output PSDs
+    to identify the main product layer. Optionally renames it to 'product'.
+    Requires Shopee VPN + imageSdk not needed (segmentation only, no CDN upload).
+    """
+    data = request.json
+    output_folder = data.get("output_folder", "").strip()
+    level1_cat    = data.get("level1_cat", "").strip()
+    level3_cat    = data.get("level3_cat", "").strip()
+    auto_rename   = data.get("auto_rename", False)
+
+    if not output_folder or not os.path.isdir(output_folder):
+        return jsonify({"error": "输出文件夹路径无效"}), 400
+    if not level1_cat or not level3_cat:
+        return jsonify({"error": "请填写 level1 和 level3 品类"}), 400
+
+    if job_state["running"]:
+        return jsonify({"error": "请等待 PSD 处理完成后再识别"}), 400
+
+    job_state["running"] = True
+    log(f"🔍 开始识别商品主体图层（品类: {level1_cat} / {level3_cat}）")
+
+    def _run_seg():
+        try:
+            import seg_product
+            summary = seg_product.process_output_folder(
+                output_folder, level1_cat, level3_cat,
+                auto_rename=auto_rename,
+                log_fn=log
+            )
+            if summary:
+                log(f"✅ 识别完成，共处理 {len(summary)} 个 PSD")
+                for fname, info in summary.items():
+                    action = "已改名为 product" if auto_rename else f"图层 {info['layer_index']}"
+                    log(f"  {fname}: {action}（rank={info['rank']}, score={info['score']:.4f}）")
+            else:
+                log("⚠️ 未能识别任何商品主体图层（请检查 Shopee VPN 连接）")
+        except ImportError:
+            log("❌ 无法导入 seg_product 模块")
+        except Exception as e:
+            log(f"❌ 识别出错: {e}")
+        finally:
+            job_state["running"] = False
+
+    threading.Thread(target=_run_seg, daemon=True).start()
+    return jsonify({"ok": True})
 # ── Doc Parser ────────────────────────────────────────────────
 def extract_naming_rules(doc_path):
     """
