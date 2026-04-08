@@ -15,6 +15,11 @@ import sys
 import os
 import json
 import base64
+import math
+import re
+import socket
+import subprocess
+import tempfile
 import time
 import requests
 from io import BytesIO
@@ -25,14 +30,39 @@ from psd_tools import PSDImage
 
 # ── Shopee API 配置 ─────────────────────────────────────────────────────────
 
-_HEADERS_LIVEISH = {
-    "Content-Type": "application/json",
-    "x-sp-sdu": "ai_engine_platform.mmuplt.controller.global.liveish.master.default",
-    "x-sp-servicekey": "f0dd2d544097d2a938595c1d78949bd3",
-    "x-sp-timeout": "60000",
-    "x-sp-processid": "process_1",
-}
-_HEADERS_SEGLABEL = {**_HEADERS_LIVEISH, "x-sp-timeout": "30000", "x-sp-processid": "CID=global"}
+_DEFAULT_GATEWAY = "https://http-gateway.spex.shopee.sg/sprpc"
+_DEFAULT_SDU = "ai_engine_platform.mmuplt.controller.global.liveish.master.default"
+_DEFAULT_SERVICEKEY = "f0dd2d544097d2a938595c1d78949bd3"
+
+
+def _mask_secret(secret):
+    if not secret:
+        return "<empty>"
+    if len(secret) <= 8:
+        return "*" * len(secret)
+    return f"{secret[:4]}...{secret[-4:]}"
+
+
+def _api_config():
+    gateway = os.getenv("SHOPEE_AI_GATEWAY", _DEFAULT_GATEWAY).rstrip("/")
+    sdu = os.getenv("SHOPEE_AI_SDU", _DEFAULT_SDU)
+    servicekey = os.getenv("SHOPEE_AI_SERVICEKEY", _DEFAULT_SERVICEKEY)
+    return {
+        "gateway": gateway,
+        "sdu": sdu,
+        "servicekey": servicekey,
+    }
+
+
+def _build_headers(processid, timeout):
+    cfg = _api_config()
+    return {
+        "Content-Type": "application/json",
+        "x-sp-sdu": cfg["sdu"],
+        "x-sp-servicekey": cfg["servicekey"],
+        "x-sp-timeout": str(timeout),
+        "x-sp-processid": processid,
+    }
 
 
 def call_service(service_name, request_data, env='liveish', max_retries=3, log_fn=None):
@@ -40,17 +70,34 @@ def call_service(service_name, request_data, env='liveish', max_retries=3, log_f
     def _log(msg):
         (log_fn or print)(msg)
 
-    url = (
-        f"https://http-gateway.spex.shopee.sg/sprpc/"
-        f"ai_engine_platform.mmuplt.{service_name}.algo"
-    )
-    headers = _HEADERS_SEGLABEL if service_name == 'seglabel2' else _HEADERS_LIVEISH
+    cfg = _api_config()
+    url = f"{cfg['gateway']}/ai_engine_platform.mmuplt.{service_name}.algo"
+    headers = _build_headers("CID=global", 30000) if service_name == 'seglabel2' else _build_headers("process_1", 60000)
+    host = url.split("/")[2]
+
+    try:
+        resolved_ip = socket.gethostbyname(host)
+    except Exception:
+        resolved_ip = None
 
     for attempt in range(max_retries):
         try:
+            if attempt == 0:
+                _log(
+                    f"  [API] {service_name} host={host} "
+                    f"ip={resolved_ip or 'unresolved'} "
+                    f"sdu={cfg['sdu']} servicekey={_mask_secret(cfg['servicekey'])}"
+                )
             resp = requests.post(url, data=json.dumps(request_data), headers=headers, timeout=60)
             if resp.status_code != 200:
-                _log(f"  [API] {service_name} HTTP {resp.status_code}: {resp.text[:300]}")
+                gateway_msg = resp.headers.get("sgw-errmsg")
+                _log(
+                    f"  [API] {service_name} HTTP {resp.status_code}"
+                    f"{f' sgw-errmsg={gateway_msg}' if gateway_msg else ''}: "
+                    f"{resp.text[:300]}"
+                )
+                if resp.status_code == 403:
+                    _log("  [API] 403 表示请求在网关层被拒绝，通常是 VPN / 白名单 / servicekey 权限问题，不是图片内容或 JSON 格式问题。")
                 if attempt < max_retries - 1:
                     time.sleep(1)
                     continue
@@ -93,6 +140,12 @@ def pil_to_base64(pil_image, max_size=1024):
     buf = BytesIO()
     img.save(buf, format='PNG', optimize=True)
     return base64.b64encode(buf.getvalue()).decode('utf-8')
+
+
+def base64_to_pil(base64_str):
+    """Decode a base64-encoded image returned by the segmentation service."""
+    image_data = base64.b64decode(base64_str)
+    return Image.open(BytesIO(image_data)).convert("RGBA")
 
 
 def piseg_pil(pil_image, cates, env='liveish', log_fn=None):
@@ -183,15 +236,362 @@ def rank_segments(label_list, bbox_list, level1_cat, level3_cat, env='liveish', 
     return call_service('pfilter2', req, env=env, log_fn=log_fn)
 
 
+def probe_api(log_fn=None):
+    """Minimal connectivity probe for the first-stage segmentation endpoint."""
+    def _log(msg):
+        (log_fn or print)(msg)
+
+    _log("[探测] 开始探测 Shopee segmentation API 网关")
+    req = {
+        "biz_type": "mmu_test",
+        "region": "sg2",
+        "task": {"image_list": []},
+    }
+    res = call_service("pisegv2", req, log_fn=log_fn, max_retries=1)
+    if res is None:
+        _log("[探测] 结果: 接口未通过。若日志中出现 403，优先检查 VPN / 白名单 / servicekey 权限。")
+        return False
+    _log("[探测] 结果: 网关可用。")
+    return True
+
+
 # ── PSD 图层处理 ─────────────────────────────────────────────────────────────
+
+def _flatten_layers(root):
+    """Depth-first flatten all layers so rename/read use the same stable index space."""
+    flat_layers = []
+
+    def walk(container, prefix=''):
+        for layer in container:
+            layer_name = (layer.name or '').strip() or '<unnamed>'
+            layer_path = f"{prefix}/{layer_name}" if prefix else layer_name
+            flat_layers.append({
+                'layer_index': len(flat_layers),
+                'layer_path': layer_path,
+                'layer': layer,
+            })
+            if layer.is_group():
+                walk(layer, layer_path)
+
+    walk(root)
+    return flat_layers
+
+
+def _is_scenebg_name(layer_name):
+    """Match scenebg, scenebg1, scenebg2... to be more tolerant of legacy files."""
+    return bool(re.fullmatch(r'scenebg\d*', (layer_name or '').strip(), flags=re.IGNORECASE))
+
+
+def _extract_local_metrics(canvas_img, doc_size, alpha_threshold=8):
+    """Estimate how much a layer looks like a foreground product cutout."""
+    doc_w, doc_h = doc_size
+    doc_area = max(doc_w * doc_h, 1)
+    alpha = canvas_img.getchannel('A')
+    mask = alpha.point(lambda px: 255 if px > alpha_threshold else 0)
+    bbox = mask.getbbox()
+    if not bbox:
+        return {
+            'bbox': None,
+            'opaque_pixels': 0,
+            'opaque_ratio': 0.0,
+            'bbox_ratio': 0.0,
+            'fill_ratio': 0.0,
+            'center_score': 0.0,
+            'edge_touches': 0,
+            'width_ratio': 0.0,
+            'height_ratio': 0.0,
+            'score': 0.0,
+        }
+
+    left, top, right, bottom = bbox
+    bbox_w = max(right - left, 1)
+    bbox_h = max(bottom - top, 1)
+    bbox_area = max(bbox_w * bbox_h, 1)
+    opaque_pixels = mask.histogram()[255]
+
+    opaque_ratio = opaque_pixels / doc_area
+    bbox_ratio = bbox_area / doc_area
+    fill_ratio = opaque_pixels / bbox_area
+    width_ratio = bbox_w / max(doc_w, 1)
+    height_ratio = bbox_h / max(doc_h, 1)
+
+    center_x = (left + right) / 2.0
+    center_y = (top + bottom) / 2.0
+    max_dist = math.hypot(doc_w / 2.0, doc_h / 2.0) or 1.0
+    center_dist = math.hypot(center_x - doc_w / 2.0, center_y - doc_h / 2.0)
+    center_score = max(0.0, 1.0 - (center_dist / max_dist))
+
+    edge_margin_x = max(4, int(doc_w * 0.02))
+    edge_margin_y = max(4, int(doc_h * 0.02))
+    edge_touches = sum([
+        left <= edge_margin_x,
+        top <= edge_margin_y,
+        (doc_w - right) <= edge_margin_x,
+        (doc_h - bottom) <= edge_margin_y,
+    ])
+
+    # Prefer medium/large isolated objects. Penalize full-canvas or edge-hugging layers.
+    prominence = opaque_ratio * (0.7 + 0.3 * center_score) * (0.5 + min(fill_ratio, 1.0))
+    prominence *= 0.6 + min(bbox_ratio / 0.15, 1.0)
+
+    if bbox_ratio > 0.65:
+        prominence *= 0.15
+    if width_ratio > 0.88:
+        prominence *= 0.35
+    if height_ratio > 0.88:
+        prominence *= 0.35
+    if edge_touches >= 3:
+        prominence *= 0.15
+    elif edge_touches == 2:
+        prominence *= 0.45
+    if fill_ratio < 0.08:
+        prominence *= 0.4
+
+    return {
+        'bbox': bbox,
+        'opaque_pixels': opaque_pixels,
+        'opaque_ratio': opaque_ratio,
+        'bbox_ratio': bbox_ratio,
+        'fill_ratio': fill_ratio,
+        'center_score': center_score,
+        'edge_touches': edge_touches,
+        'width_ratio': width_ratio,
+        'height_ratio': height_ratio,
+        'score': prominence,
+    }
+
+
+def _bbox_to_xyxy(bbox):
+    if bbox is None:
+        return None
+    if hasattr(bbox, 'left'):
+        return int(bbox.left), int(bbox.top), int(bbox.right), int(bbox.bottom)
+    return int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
+
+
+def _segment_to_full_canvas(seg_b64, bbox, doc_size):
+    """Paste a cropped segmentation image back onto a transparent full-canvas image."""
+    doc_w, doc_h = doc_size
+    seg_img = base64_to_pil(seg_b64)
+    full_canvas = Image.new('RGBA', (doc_w, doc_h), (0, 0, 0, 0))
+    left, top, _, _ = _bbox_to_xyxy(bbox)
+    full_canvas.paste(seg_img, (left, top), seg_img)
+    return full_canvas
+
+
+def _should_split_candidate(source_metrics, segment_metrics):
+    """
+    Decide whether the best API segment should become a new product layer instead of
+    simply renaming the original scenebg layer.
+    """
+    src_pixels = max(source_metrics.get('opaque_pixels', 0), 1)
+    seg_pixels = segment_metrics.get('opaque_pixels', 0)
+    coverage = seg_pixels / src_pixels
+
+    if coverage >= 0.92:
+        return False
+    if coverage <= 0.75:
+        return True
+    if source_metrics.get('edge_touches', 0) >= 2 and coverage < 0.88:
+        return True
+    if source_metrics.get('bbox_ratio', 0.0) > 0.55 and coverage < 0.9:
+        return True
+    return False
+
+
+def find_photoshop_app_name():
+    """Return the exact installed Photoshop app name for AppleScript tell blocks."""
+    try:
+        result = subprocess.run(
+            ["mdfind", "kMDItemCFBundleIdentifier == 'com.adobe.Photoshop'"],
+            capture_output=True, text=True, timeout=10
+        )
+        for path in result.stdout.strip().splitlines():
+            if path.endswith(".app"):
+                name = os.path.basename(path).replace(".app", "")
+                if "Photoshop" in name:
+                    return name
+    except Exception:
+        pass
+    return "Adobe Photoshop"
+
+
+def _run_photoshop_jsx(jsx_code, log_fn=None, timeout=180):
+    """Execute a JSX snippet in Photoshop via AppleScript."""
+    def _log(msg):
+        (log_fn or print)(msg)
+
+    with tempfile.NamedTemporaryFile('w', encoding='utf-8', suffix='.jsx', delete=False) as jsx_file:
+        jsx_file.write(jsx_code)
+        jsx_path = jsx_file.name
+
+    jsx_path_js = jsx_path.replace("\\", "/").replace("'", "\\'")
+    jsx_loader = (
+        f"var _f=new File('{jsx_path_js}');"
+        "_f.open('r');var _s=_f.read();_f.close();eval(_s);"
+    )
+    ps_app_name = find_photoshop_app_name().replace('"', '\\"')
+
+    with tempfile.NamedTemporaryFile('w', encoding='utf-8', suffix='.applescript', delete=False) as as_file:
+        as_file.write(
+            f'tell application "{ps_app_name}"\n'
+            f'    activate\n'
+            f'    do javascript "{jsx_loader}"\n'
+            f'end tell\n'
+        )
+        as_path = as_file.name
+
+    try:
+        result = subprocess.run(
+            ["osascript", as_path],
+            capture_output=True, text=True, timeout=timeout
+        )
+        if result.returncode != 0:
+            stderr = (result.stderr or result.stdout or "").strip()
+            _log(f"[PS] JSX 执行失败: {stderr}")
+            return False
+        return True
+    finally:
+        Path(jsx_path).unlink(missing_ok=True)
+        Path(as_path).unlink(missing_ok=True)
+
+
+def split_product_in_psd(psd_path, source_layer_index, product_png_path, new_name='product', log_fn=None):
+    """
+    Insert a segmented product PNG as a new Photoshop layer and clear those pixels
+    from the original source layer, so the product is actually split out.
+    """
+    def _log(msg):
+        (log_fn or print)(msg)
+
+    psd_path_js = str(psd_path).replace("\\", "/").replace("'", "\\'")
+    product_png_js = str(product_png_path).replace("\\", "/").replace("'", "\\'")
+    new_name_js = new_name.replace("\\", "\\\\").replace('"', '\\"')
+
+    jsx = f"""#target photoshop
+app.displayDialogs = DialogModes.NO;
+
+function flattenLayers(container, acc) {{
+    for (var i = 0; i < container.layers.length; i++) {{
+        var layer = container.layers[i];
+        acc.push(layer);
+        if (layer.typename === "LayerSet") {{
+            flattenLayers(layer, acc);
+        }}
+    }}
+}}
+
+function selectTransparency(layer) {{
+    var desc = new ActionDescriptor();
+    var ref = new ActionReference();
+    ref.putProperty(charIDToTypeID("Chnl"), charIDToTypeID("fsel"));
+    desc.putReference(charIDToTypeID("null"), ref);
+    var ref2 = new ActionReference();
+    ref2.putEnumerated(charIDToTypeID("Chnl"), charIDToTypeID("Chnl"), charIDToTypeID("Trsp"));
+    ref2.putIdentifier(charIDToTypeID("Lyr "), layer.id);
+    desc.putReference(charIDToTypeID("T   "), ref2);
+    executeAction(charIDToTypeID("setd"), desc, DialogModes.NO);
+}}
+
+var psdFile = new File('{psd_path_js}');
+var pngFile = new File('{product_png_js}');
+if (!psdFile.exists) throw new Error("PSD file not found");
+if (!pngFile.exists) throw new Error("Product PNG not found");
+
+var doc = app.open(psdFile);
+var flat = [];
+flattenLayers(doc, flat);
+if ({source_layer_index} >= flat.length) throw new Error("Source layer index out of range");
+var sourceLayer = flat[{source_layer_index}];
+if (sourceLayer.typename === "LayerSet") throw new Error("Source layer points to group");
+
+var segDoc = app.open(pngFile);
+segDoc.selection.selectAll();
+segDoc.selection.copy();
+segDoc.close(SaveOptions.DONOTSAVECHANGES);
+
+app.activeDocument = doc;
+var productLayer = doc.paste();
+productLayer.name = "{new_name_js}";
+doc.activeLayer = productLayer;
+selectTransparency(productLayer);
+
+doc.activeLayer = sourceLayer;
+try {{ sourceLayer.allLocked = false; }} catch(e) {{}}
+try {{ sourceLayer.transparentPixelsLocked = false; }} catch(e) {{}}
+try {{
+    if (sourceLayer.kind !== LayerKind.NORMAL) {{
+        sourceLayer.rasterize(RasterizeType.ENTIRELAYER);
+    }}
+}} catch(e) {{}}
+doc.selection.clear();
+doc.selection.deselect();
+
+doc.activeLayer = productLayer;
+var opts = new PhotoshopSaveOptions();
+opts.layers = true;
+opts.embedColorProfile = true;
+opts.annotations = false;
+opts.alphaChannels = true;
+opts.spotColors = true;
+doc.saveAs(psdFile, opts, true);
+doc.close(SaveOptions.DONOTSAVECHANGES);
+"""
+
+    ok = _run_photoshop_jsx(jsx, log_fn=log_fn)
+    if ok:
+        _log(f"[扣图] 已将分割主体写回 PSD，并命名为 '{new_name}'")
+    return ok
+
+
+def _rank_local_candidates(layers, log_fn=None):
+    """Rank scenebg layers using local geometry so we still work without VPN/API."""
+    def _log(msg):
+        (log_fn or print)(msg)
+
+    ranked = []
+    for item in layers:
+        metrics = item['metrics']
+        if metrics['opaque_pixels'] <= 0:
+            _log(f"[本地识别] 跳过空图层 #{item['layer_index']} {item['layer_path']}")
+            continue
+
+        left, top, right, bottom = metrics['bbox']
+        _log(
+            f"[本地识别] 图层 #{item['layer_index']} {item['layer_path']}: "
+            f"bbox=({left},{top},{right},{bottom}) "
+            f"opaque={metrics['opaque_ratio']:.4f} "
+            f"fill={metrics['fill_ratio']:.4f} "
+            f"center={metrics['center_score']:.4f} "
+            f"edges={metrics['edge_touches']} "
+            f"score={metrics['score']:.6f}"
+        )
+        ranked.append((item['layer_index'], item['layer_path'], metrics['score']))
+
+    ranked.sort(key=lambda entry: (-entry[2], entry[0]))
+
+    results = {}
+    if ranked:
+        _log("[本地识别] 排名结果:")
+    for rank, (layer_index, layer_path, score) in enumerate(ranked):
+        _log(f"  #{rank + 1}: 图层 {layer_index} ({layer_path}) score={score:.6f}")
+        results[layer_index] = {
+            'rank': rank,
+            'score': score,
+            'method': 'local',
+            'layer_path': layer_path,
+            'split_needed': False,
+            'action': 'rename',
+        }
+    return results
 
 def export_scenebg_layers(psd_path, log_fn=None):
     """
     打开处理后的 PSD，将所有名为 'scenebg' 的图层导出为 PIL image。
     关键：每个图层粘贴在与 PSD 等大的全画布上（透明背景），
-    保留图层在画面中的位置上下文，让 API 能正确判断是否是主体。
+    保留图层在画面中的位置上下文，让 API / 本地启发式都能判断主体。
 
-    返回 [(layer_index, layer_name, full_canvas_pil), ...]
+    返回 [{layer_index, layer_name, layer_path, layer_img_rgba, canvas, metrics}, ...]
     """
     def _log(msg):
         (log_fn or print)(msg)
@@ -201,28 +601,42 @@ def export_scenebg_layers(psd_path, log_fn=None):
     _log(f"  [PSD] 文档尺寸: {doc_w}×{doc_h}")
 
     results = []
-    for i, layer in enumerate(psd):
-        if layer.name != 'scenebg':
+    for flat in _flatten_layers(psd):
+        layer = flat['layer']
+        if layer.is_group() or not _is_scenebg_name(layer.name):
             continue
         try:
             layer_img = layer.composite()
             if layer_img is None:
-                _log(f"  [PSD] 图层 {i} composite() 返回 None，跳过")
+                _log(f"  [PSD] 图层 {flat['layer_index']} composite() 返回 None，跳过")
                 continue
 
             layer_img_rgba = layer_img.convert('RGBA')   # 图层自身（用于分析）
 
             # 粘贴到全画布，保留位置信息（用于 API 调用）
             canvas = Image.new('RGBA', (doc_w, doc_h), (0, 0, 0, 0))
-            bbox = layer.bbox   # BBox(left, top, right, bottom)
-            canvas.paste(layer_img_rgba, (bbox.left, bbox.top))
+            bbox = layer.bbox   # tuple or BBox(left, top, right, bottom)
+            if hasattr(bbox, 'left'):
+                left, top = bbox.left, bbox.top
+            else:
+                left, top = int(bbox[0]), int(bbox[1])
+            canvas.paste(layer_img_rgba, (left, top))
+            metrics = _extract_local_metrics(canvas, (doc_w, doc_h))
 
-            # 返回 4-tuple：(index, name, 图层自身RGBA, 全画布RGBA)
-            results.append((i, layer.name, layer_img_rgba, canvas))
-            _log(f"  [PSD] 图层 {i}: {layer.name}  位置=({bbox.left},{bbox.top})  "
-                 f"图层尺寸={layer_img_rgba.size}  画布={canvas.size}")
+            results.append({
+                'layer_index': flat['layer_index'],
+                'layer_name': layer.name,
+                'layer_path': flat['layer_path'],
+                'layer_img_rgba': layer_img_rgba,
+                'canvas': canvas,
+                'metrics': metrics,
+            })
+            _log(
+                f"  [PSD] 图层 {flat['layer_index']}: {flat['layer_path']}  "
+                f"位置=({left},{top}) 图层尺寸={layer_img.size} 画布={canvas.size}"
+            )
         except Exception as e:
-            _log(f"  [PSD] 图层 {i} ({layer.name}) 导出失败: {e}")
+            _log(f"  [PSD] 图层 {flat['layer_index']} ({flat['layer_path']}) 导出失败: {e}")
 
     return results
 
@@ -233,9 +647,9 @@ def detect_existing_cutout(layers, log_fn=None):
     """
     检测 scenebg 图层中是否已有商品主体图层。
 
-    layers 格式（4-tuple）：(layer_idx, layer_name, layer_img_rgba, canvas_img)
+    layers 格式：[{layer_index, layer_path, layer_img_rgba, canvas, ...}, ...]
       - layer_img_rgba：图层自身裁剪区域（用于分析，不含画布填充边框）
-      - canvas_img：全画布版本（保留给 API 调用，此函数不使用）
+      - canvas：全画布版本（保留给 API 调用，此函数不使用）
 
     路径 A — 透明扣图检测（分析图层自身的 alpha）：
       图层本身有透明背景（已扣图），商品主体清晰可见。
@@ -263,7 +677,7 @@ def detect_existing_cutout(layers, log_fn=None):
         return None
 
     # canvas_area 用于比较图层相对大小，layer_img_rgba 用于分析内容
-    canvas_area = layers[0][3].width * layers[0][3].height  # 第4个元素是 canvas_img
+    canvas_area = layers[0]['canvas'].width * layers[0]['canvas'].height
 
     def cosine(h1, h2):
         if not h1 or not h2:
@@ -275,7 +689,10 @@ def detect_existing_cutout(layers, log_fn=None):
 
     # ── 预计算每层指标（全部基于 layer_img_rgba，不含画布边框假透明） ──────────
     info = []
-    for layer_idx, layer_name, layer_img_rgba, _canvas in layers:
+    for item in layers:
+        layer_idx = item['layer_index']
+        layer_name = item['layer_path']
+        layer_img_rgba = item['layer_img_rgba']
         alpha      = layer_img_rgba.split()[3]
         alpha_hist = alpha.histogram()
         total      = sum(alpha_hist)
@@ -398,12 +815,25 @@ def _api_identify(layers, level1_cat, level3_cat, log_fn=None):
     def _log(msg):
         (log_fn or print)(msg)
 
-    cates = [level1_cat, '', ''] if level1_cat else ['', '', '']
+    local_results = _rank_local_candidates(layers, log_fn=log_fn)
+    if not local_results:
+        _log("[本地识别] 没有可用的 scenebg 候选图层")
+        return {}
 
+    if not level1_cat and not level3_cat:
+        _log("[扣图] 未提供品类，尝试使用通用 API 分割；若失败则回退到本地启发式结果")
+
+    cates = [level1_cat or '', '', '']
     all_labels, all_bboxes, all_seg_meta = [], [], []
 
-    for layer_idx, layer_name, _layer_img, canvas_img in layers:
-        _log(f"[扣图] → 分割图层 {layer_idx}（全画布 {canvas_img.size}）")
+    for item in layers:
+        layer_idx = item['layer_index']
+        canvas_img = item['canvas']
+        if item['metrics']['opaque_pixels'] <= 0:
+            _log(f"[扣图] → 跳过空图层 {layer_idx}（{item['layer_path']}）")
+            continue
+
+        _log(f"[扣图] → 分割图层 {layer_idx}（{item['layer_path']}，全画布 {canvas_img.size}）")
         seg = piseg_pil(canvas_img, cates, log_fn=log_fn)
         if seg is None:
             _log(f"[扣图]   piseg 失败，跳过图层 {layer_idx}")
@@ -425,17 +855,29 @@ def _api_identify(layers, level1_cat, level3_cat, log_fn=None):
                 continue
             all_labels.append(label)
             all_bboxes.append(bbox)
-            all_seg_meta.append((layer_idx, s_i))
+            seg_canvas = _segment_to_full_canvas(s_b64, bbox, canvas_img.size)
+            seg_metrics = _extract_local_metrics(seg_canvas, canvas_img.size)
+            all_seg_meta.append({
+                'layer_index': layer_idx,
+                'segment_index': s_i,
+                'segment_base64': s_b64,
+                'segment_bbox': bbox,
+                'segment_label': s_label,
+                'layer_path': item['layer_path'],
+                'source_metrics': item['metrics'],
+                'segment_metrics': seg_metrics,
+                'doc_size': canvas_img.size,
+            })
 
     if not all_labels:
-        _log("[扣图] 无有效分割块，API 可能不可用（请检查 VPN）")
-        return {}
+        _log("[扣图] 无有效分割块，API 可能不可用，回退到本地启发式结果")
+        return local_results
 
     _log(f"[扣图] 对 {len(all_labels)} 个分割块进行排名...")
     rank_raw = rank_segments(all_labels, all_bboxes, level1_cat or '', level3_cat or '', log_fn=log_fn)
     if rank_raw is None:
-        _log("[扣图] 排名 API 失败")
-        return {}
+        _log("[扣图] 排名 API 失败，回退到本地启发式结果")
+        return local_results
 
     try:
         rank_data  = json.loads(rank_raw['label'])
@@ -443,26 +885,44 @@ def _api_identify(layers, level1_cat, level3_cat, log_fn=None):
         seg_scores = rank_data['score']
     except Exception as e:
         _log(f"[扣图] 排名结果解析失败: {e}  原始: {str(rank_raw)[:200]}")
-        return {}
+        _log("[扣图] 回退到本地启发式结果")
+        return local_results
 
     layer_best: dict = {}
     for rank_pos, seg_idx in enumerate(seg_ranks):
         if seg_idx < len(all_seg_meta):
-            layer_idx, _ = all_seg_meta[seg_idx]
+            seg_meta = all_seg_meta[seg_idx]
+            layer_idx = seg_meta['layer_index']
             if layer_idx not in layer_best:
+                split_needed = _should_split_candidate(seg_meta['source_metrics'], seg_meta['segment_metrics'])
                 layer_best[layer_idx] = {
                     'rank': rank_pos,
                     'score': seg_scores[rank_pos],
-                    'method': 'api'
+                    'method': 'api',
+                    'layer_path': seg_meta['layer_path'],
+                    'segment_base64': seg_meta['segment_base64'],
+                    'segment_bbox': seg_meta['segment_bbox'],
+                    'segment_label': seg_meta['segment_label'],
+                    'source_metrics': seg_meta['source_metrics'],
+                    'segment_metrics': seg_meta['segment_metrics'],
+                    'doc_size': seg_meta['doc_size'],
+                    'split_needed': split_needed,
+                    'action': 'split' if split_needed else 'rename',
                 }
 
-    _log("[扣图] API 识别结果:")
-    for layer_idx, layer_name, _li, _ci in layers:
+    _log("[扣图] 识别结果:")
+    for item in layers:
+        layer_idx = item['layer_index']
+        layer_name = item['layer_path']
         if layer_idx in layer_best:
             r = layer_best[layer_idx]
             _log(f"  图层 {layer_idx} ({layer_name}): rank={r['rank']}, score={r['score']:.4f}")
         else:
             _log(f"  图层 {layer_idx} ({layer_name}): 无有效分割")
+
+    if not layer_best:
+        _log("[扣图] API 未返回可用候选，回退到本地启发式结果")
+        return local_results
 
     return layer_best
 
@@ -509,22 +969,41 @@ def rename_product_in_psd(psd_path, product_layer_index, new_name='product', log
         (log_fn or print)(msg)
 
     psd = PSDImage.open(psd_path)
-    layers_list = list(psd)
+    layers_list = _flatten_layers(psd)
     if product_layer_index >= len(layers_list):
         _log(f"[扣图] 图层索引 {product_layer_index} 超出范围（共 {len(layers_list)} 层）")
         return False
-    layer = layers_list[product_layer_index]
+    layer_info = layers_list[product_layer_index]
+    layer = layer_info['layer']
     old_name = layer.name
     layer.name = new_name
     psd.save(psd_path)
-    _log(f"[扣图] 图层 {product_layer_index}: '{old_name}' → '{new_name}'  已保存")
+    _log(
+        f"[扣图] 图层 {product_layer_index} ({layer_info['layer_path']}): "
+        f"'{old_name}' → '{new_name}'  已保存"
+    )
     return True
+
+
+def materialize_segment_png(seg_base64, bbox, doc_size, log_fn=None):
+    """Write the winning segmentation result to a transparent full-canvas PNG."""
+    def _log(msg):
+        (log_fn or print)(msg)
+
+    full_canvas = _segment_to_full_canvas(seg_base64, bbox, doc_size)
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.png')
+    tmp_path = Path(tmp.name)
+    tmp.close()
+    full_canvas.save(tmp_path, format='PNG')
+    _log(f"[扣图] 已生成临时 product PNG: {tmp_path}")
+    return tmp_path
 
 
 def process_output_folder(output_folder, level1_cat, level3_cat, auto_rename=True, log_fn=None):
     """
     对输出文件夹中所有 PSD 批量识别商品主体图层。
     auto_rename=True 时自动将最优图层改名为 'product'。
+    无品类或 Shopee 接口不可用时，自动回退到本地启发式识别。
     """
     def _log(msg):
         (log_fn or print)(msg)
@@ -546,15 +1025,45 @@ def process_output_folder(output_folder, level1_cat, level3_cat, auto_rename=Tru
             'layer_index': best_idx,
             'rank': best['rank'],
             'score': best['score'],
-            'method': method
+            'action': best.get('action', 'rename'),
+            'method': method,
         }
 
-        method_label = "已有扣图（直接命名）" if method == 'cutout' else "API 识别"
+        if method == 'cutout':
+            method_label = "已有扣图（直接命名）"
+        elif method == 'local':
+            method_label = "本地启发式识别"
+        else:
+            method_label = "API 识别"
         _log(f"[扣图] {psd_path.name}: 商品主体 = 图层 {best_idx}"
              f"（{method_label}，score={best['score']:.4f}）")
 
         if auto_rename:
-            rename_product_in_psd(str(psd_path), best_idx, 'product', log_fn=log_fn)
+            if best.get('action') == 'split' and best.get('segment_base64'):
+                tmp_png_path = None
+                try:
+                    tmp_png_path = materialize_segment_png(
+                        best['segment_base64'],
+                        best['segment_bbox'],
+                        best['doc_size'],
+                        log_fn=log_fn
+                    )
+                    ok = split_product_in_psd(
+                        str(psd_path),
+                        best_idx,
+                        str(tmp_png_path),
+                        'product',
+                        log_fn=log_fn
+                    )
+                    if not ok:
+                        _log("[扣图] 分割写回失败，回退为直接改名")
+                        rename_product_in_psd(str(psd_path), best_idx, 'product', log_fn=log_fn)
+                        summary[psd_path.name]['action'] = 'rename_fallback'
+                finally:
+                    if tmp_png_path:
+                        Path(tmp_png_path).unlink(missing_ok=True)
+            else:
+                rename_product_in_psd(str(psd_path), best_idx, 'product', log_fn=log_fn)
 
     return summary
 
@@ -562,9 +1071,14 @@ def process_output_folder(output_folder, level1_cat, level3_cat, auto_rename=Tru
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
+    if len(sys.argv) >= 2 and sys.argv[1] == '--probe-api':
+        ok = probe_api()
+        sys.exit(0 if ok else 2)
+
     if len(sys.argv) < 2:
         print("用法: python seg_product.py <psd路径> [level1品类] [level3品类]")
         print('示例: python seg_product.py output/kettle.psd "Electronics" "Electric Kettles"')
+        print('探测: python seg_product.py --probe-api')
         sys.exit(1)
 
     psd_p = sys.argv[1]

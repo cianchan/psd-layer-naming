@@ -72,9 +72,9 @@
           </div>
         </div>
 
-        <!-- Product category inputs (optional, improves detection accuracy) -->
+        <!-- Product category inputs (optional, enables API-assisted refinement) -->
         <div class="pt-1 border-t border-gray-100">
-          <label class="block text-sm text-gray-600 mb-2">商品品类 <span class="text-xs text-gray-400 font-normal">（可选，填写后识别更准确，需 Shopee VPN）</span></label>
+          <label class="block text-sm text-gray-600 mb-2">商品品类 <span class="text-xs text-gray-400 font-normal">（可选；不填时使用本地识别，填写后可结合 Shopee VPN 进一步增强）</span></label>
           <div class="flex gap-3">
             <div class="flex-1">
               <input id="seg-level1" type="text" placeholder="Level1 品类，如 Electronics" oninput="save()"

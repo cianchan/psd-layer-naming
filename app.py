@@ -241,7 +241,7 @@ def run():
                 if summary:
                     log(f"✅ 商品主体识别完成，共处理 {len(summary)} 个 PSD")
                 else:
-                    log("⚠️ 未能识别商品主体（请检查 Shopee VPN 是否连接）")
+                    log("⚠️ 未能识别商品主体（可尝试补充品类信息，或检查 PSD 中是否存在可见的 scenebg 图层）")
             except Exception as e:
                 log(f"❌ 商品主体识别出错: {e}")
 
@@ -287,9 +287,9 @@ def status():
 @app.route("/api/identify_products", methods=["POST"])
 def identify_products():
     """
-    Post-process: run Shopee segmentation API on all 'scenebg' layers in output PSDs
-    to identify the main product layer. Optionally renames it to 'product'.
-    Requires Shopee VPN + imageSdk not needed (segmentation only, no CDN upload).
+    Post-process: identify the main product layer among all scenebg layers.
+    Uses local heuristics by default, and will further use Shopee segmentation
+    when category info + VPN are available. Optionally renames it to 'product'.
     """
     data = request.json
     output_folder = data.get("output_folder", "").strip()
@@ -299,14 +299,12 @@ def identify_products():
 
     if not output_folder or not os.path.isdir(output_folder):
         return jsonify({"error": "输出文件夹路径无效"}), 400
-    if not level1_cat or not level3_cat:
-        return jsonify({"error": "请填写 level1 和 level3 品类"}), 400
 
     if job_state["running"]:
         return jsonify({"error": "请等待 PSD 处理完成后再识别"}), 400
 
     job_state["running"] = True
-    log(f"🔍 开始识别商品主体图层（品类: {level1_cat} / {level3_cat}）")
+    log(f"🔍 开始识别商品主体图层（品类: {level1_cat or '(未填)'} / {level3_cat or '(未填)'}）")
 
     def _run_seg():
         try:
@@ -319,10 +317,18 @@ def identify_products():
             if summary:
                 log(f"✅ 识别完成，共处理 {len(summary)} 个 PSD")
                 for fname, info in summary.items():
-                    action = "已改名为 product" if auto_rename else f"图层 {info['layer_index']}"
+                    if auto_rename:
+                        if info.get('action') == 'split':
+                            action = "已分割主体并生成 product 图层"
+                        elif info.get('action') == 'rename_fallback':
+                            action = "分割失败，已回退为重命名 product"
+                        else:
+                            action = "已改名为 product"
+                    else:
+                        action = f"图层 {info['layer_index']}"
                     log(f"  {fname}: {action}（rank={info['rank']}, score={info['score']:.4f}）")
             else:
-                log("⚠️ 未能识别任何商品主体图层（请检查 Shopee VPN 连接）")
+                log("⚠️ 未能识别任何商品主体图层（可尝试补充品类信息，或检查 PSD 中是否存在可见的 scenebg 图层）")
         except ImportError:
             log("❌ 无法导入 seg_product 模块")
         except Exception as e:
