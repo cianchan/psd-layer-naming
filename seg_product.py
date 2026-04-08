@@ -210,43 +210,199 @@ def export_scenebg_layers(psd_path, log_fn=None):
                 _log(f"  [PSD] 图层 {i} composite() 返回 None，跳过")
                 continue
 
-            # 粘贴到全画布，保留位置信息
+            layer_img_rgba = layer_img.convert('RGBA')   # 图层自身（用于分析）
+
+            # 粘贴到全画布，保留位置信息（用于 API 调用）
             canvas = Image.new('RGBA', (doc_w, doc_h), (0, 0, 0, 0))
             bbox = layer.bbox   # BBox(left, top, right, bottom)
-            canvas.paste(layer_img.convert('RGBA'), (bbox.left, bbox.top))
+            canvas.paste(layer_img_rgba, (bbox.left, bbox.top))
 
-            results.append((i, layer.name, canvas))
+            # 返回 4-tuple：(index, name, 图层自身RGBA, 全画布RGBA)
+            results.append((i, layer.name, layer_img_rgba, canvas))
             _log(f"  [PSD] 图层 {i}: {layer.name}  位置=({bbox.left},{bbox.top})  "
-                 f"图层尺寸={layer_img.size}  画布={canvas.size}")
+                 f"图层尺寸={layer_img_rgba.size}  画布={canvas.size}")
         except Exception as e:
             _log(f"  [PSD] 图层 {i} ({layer.name}) 导出失败: {e}")
 
     return results
 
 
-def identify_product_layer(psd_path, level1_cat, level3_cat, log_fn=None):
-    """
-    主函数：识别 PSD 中哪个 'scenebg' 图层是商品主体。
+# ── Case 1：透明度 / 重复内容 / 尺寸排除 三路检测（无需 API） ───────────────
 
-    返回:
-        { layer_index: {'rank': int, 'score': float}, ... }
-        rank 越小越可能是商品主体；空 dict 表示识别失败。
+def detect_existing_cutout(layers, log_fn=None):
+    """
+    检测 scenebg 图层中是否已有商品主体图层。
+
+    layers 格式（4-tuple）：(layer_idx, layer_name, layer_img_rgba, canvas_img)
+      - layer_img_rgba：图层自身裁剪区域（用于分析，不含画布填充边框）
+      - canvas_img：全画布版本（保留给 API 调用，此函数不使用）
+
+    路径 A — 透明扣图检测（分析图层自身的 alpha）：
+      图层本身有透明背景（已扣图），商品主体清晰可见。
+      条件：图层自身 transparent_ratio 0.10-0.88，图层面积≥画布3%，宽高比 0.15-6.5。
+      → 多候选取面积最大的。
+
+    路径 B — 重复内容检测（分析图层自身内容相似度）：
+      多个 scenebg 含相似内容（扣图层 + 场景图层同时包含该商品）。
+      两两比较图层不透明区域 RGB 直方图，相似度≥0.80 时，面积较小者 = 商品主体。
+      → 取面积最小的候选。
+
+    路径 C — 尺寸排除法（处理无透明通道的商品图）：
+      适用于商品在白色/纯色背景上（transparent_ratio≈0），无法用 alpha 检测的情况。
+      在「实质内容」图层（面积>8%画布，几乎不透明）中：
+        - 只有 1 个 → 直接是商品（如 MX3 PSD 只有一个产品图）
+        - 多个 → 排除面积最大的（= 填满画布的场景背景），选次大的（= 商品主体）
+
+    优先级：B > C > A。
+    返回 (layer_idx, layer_name) 或 None。
+    """
+    def _log(msg):
+        (log_fn or print)(msg)
+
+    if not layers:
+        return None
+
+    # canvas_area 用于比较图层相对大小，layer_img_rgba 用于分析内容
+    canvas_area = layers[0][3].width * layers[0][3].height  # 第4个元素是 canvas_img
+
+    def cosine(h1, h2):
+        if not h1 or not h2:
+            return 0.0
+        dot  = sum(a * b for a, b in zip(h1, h2))
+        mag1 = sum(a * a for a in h1) ** 0.5
+        mag2 = sum(b * b for b in h2) ** 0.5
+        return dot / (mag1 * mag2) if (mag1 and mag2) else 0.0
+
+    # ── 预计算每层指标（全部基于 layer_img_rgba，不含画布边框假透明） ──────────
+    info = []
+    for layer_idx, layer_name, layer_img_rgba, _canvas in layers:
+        alpha      = layer_img_rgba.split()[3]
+        alpha_hist = alpha.histogram()
+        total      = sum(alpha_hist)
+        if total == 0:
+            continue
+
+        # 图层自身的透明比（不受画布边框影响）
+        transparent_ratio = sum(alpha_hist[:50]) / total
+
+        opaque_mask = alpha.point(lambda p: 255 if p >= 50 else 0, mode='L')
+        bb = opaque_mask.getbbox()
+        if bb is None:
+            opaque_area = aspect = 0
+            rgb_hist = None
+        else:
+            bw = bb[2] - bb[0]
+            bh = bb[3] - bb[1]
+            opaque_area = bw * bh
+            aspect = bw / bh if bh > 0 else 999.0
+            # 仅取不透明区域的 RGB，缩到 32×32 做直方图
+            r, g, b, _ = layer_img_rgba.split()
+            rgb_crop = Image.merge('RGB', (r, g, b)).crop(bb)
+            rgb_hist = rgb_crop.resize((32, 32), Image.LANCZOS).histogram()
+
+        _log(f"  [检测] 图层 {layer_idx} ({layer_name}): "
+             f"图层自身透明比={transparent_ratio:.1%}, "
+             f"内容面积={opaque_area/canvas_area:.1%}画布, "
+             f"图层尺寸={layer_img_rgba.size}")
+
+        info.append({
+            'idx': layer_idx, 'name': layer_name,
+            'transparent_ratio': transparent_ratio,
+            'opaque_area': opaque_area,
+            'aspect': aspect,
+            'rgb_hist': rgb_hist,
+        })
+
+    # ── 路径 A：透明扣图（图层自身有 alpha） ────────────────────────────────────
+    a_candidates = []
+    for d in info:
+        if not (0.10 <= d['transparent_ratio'] <= 0.88):
+            continue
+        if d['opaque_area'] < canvas_area * 0.03:
+            _log(f"  [检测] 图层 {d['idx']} ({d['name']}): 内容面积太小 → A路径跳过")
+            continue
+        if not (0.15 <= d['aspect'] <= 6.5):
+            _log(f"  [检测] 图层 {d['idx']} ({d['name']}): 宽高比 {d['aspect']:.2f} 异常 → A路径跳过")
+            continue
+        _log(f"  [检测] 图层 {d['idx']} ({d['name']}): ✓ 路径A候选 "
+             f"透明比={d['transparent_ratio']:.1%}, 宽高比={d['aspect']:.2f}")
+        a_candidates.append(d)
+
+    # ── 路径 B：重复内容检测（两两直方图比较） ──────────────────────────────────
+    b_candidates = {}
+    for i in range(len(info)):
+        for j in range(i + 1, len(info)):
+            sim = cosine(info[i]['rgb_hist'], info[j]['rgb_hist'])
+            if sim >= 0.80:
+                smaller = info[i] if info[i]['opaque_area'] <= info[j]['opaque_area'] else info[j]
+                _log(f"  [检测] 图层 {info[i]['idx']}↔{info[j]['idx']} "
+                     f"内容相似(sim={sim:.2f}) → 小面积图层 {smaller['idx']} ({smaller['name']}) 路径B候选")
+                if smaller['idx'] not in b_candidates:
+                    b_candidates[smaller['idx']] = smaller
+
+    # ── 路径 C：尺寸排除法（无 alpha 的商品图）──────────────────────────────────
+    # 场景背景 = 面积最大的几乎不透明图层（填满画布）
+    # 商品主体 = 次大的图层；若只有1个实质内容层则直接是商品
+    c_pool = [d for d in info
+              if d['transparent_ratio'] < 0.10        # 几乎不透明（无真实 alpha）
+              and d['opaque_area'] > canvas_area * 0.08]  # 有实质内容（> 8% 画布）
+
+    if c_pool:
+        if len(c_pool) == 1:
+            d = c_pool[0]
+            _log(f"  [检测] 图层 {d['idx']} ({d['name']}): ✓ 路径C候选 "
+                 f"（唯一实质内容图层，面积={d['opaque_area']/canvas_area:.1%}）")
+            c_candidates = [d]
+        else:
+            # 排除面积最大的（= 场景背景）
+            sorted_pool = sorted(c_pool, key=lambda x: x['opaque_area'], reverse=True)
+            excluded = sorted_pool[0]
+            _log(f"  [检测] 图层 {excluded['idx']} ({excluded['name']}): "
+                 f"面积最大({excluded['opaque_area']/canvas_area:.1%}) → C路径排除（疑为场景背景）")
+            c_candidates = sorted_pool[1:]
+            for d in c_candidates:
+                _log(f"  [检测] 图层 {d['idx']} ({d['name']}): ✓ 路径C候选 "
+                     f"面积={d['opaque_area']/canvas_area:.1%}")
+    else:
+        c_candidates = []
+
+    # ── 选择最终结果（优先级 B > C > A） ─────────────────────────────────────
+    if b_candidates:
+        best = min(b_candidates.values(), key=lambda d: d['opaque_area'])
+        _log(f"  [检测] ✅ 路径B 命中：图层 {best['idx']} ({best['name']}) 为商品主体")
+        return best['idx'], best['name']
+
+    if c_candidates:
+        # 路径 C 中取面积最大的（最完整的商品图）
+        best = max(c_candidates, key=lambda d: d['opaque_area'])
+        _log(f"  [检测] ✅ 路径C 命中：图层 {best['idx']} ({best['name']}) 为商品主体 "
+             f"(面积={best['opaque_area']/canvas_area:.1%})")
+        return best['idx'], best['name']
+
+    if a_candidates:
+        best = max(a_candidates, key=lambda d: d['opaque_area'])
+        _log(f"  [检测] ✅ 路径A 命中：图层 {best['idx']} ({best['name']}) 为商品主体")
+        return best['idx'], best['name']
+
+    return None
+
+
+# ── Case 2：API 分割（兜底） ──────────────────────────────────────────────────
+
+def _api_identify(layers, level1_cat, level3_cat, log_fn=None):
+    """
+    用 piseg API 在 scenebg 图层中寻找商品主体。
+    优先对最不透明（内容最多）的图层调用 API。
+    返回 { layer_idx: {'rank': int, 'score': float, 'method': 'api'} } 或 {}。
     """
     def _log(msg):
         (log_fn or print)(msg)
 
     cates = [level1_cat, '', ''] if level1_cat else ['', '', '']
-    _log(f"[扣图] 开始识别: {Path(psd_path).name}")
-    _log(f"[扣图] 品类: {level1_cat or '(未填)'} / {level3_cat or '(未填)'}")
-
-    layers = export_scenebg_layers(psd_path, log_fn=log_fn)
-    if not layers:
-        _log("[扣图] 未找到 scenebg 图层")
-        return {}
 
     all_labels, all_bboxes, all_seg_meta = [], [], []
 
-    for layer_idx, layer_name, canvas_img in layers:
+    for layer_idx, layer_name, _layer_img, canvas_img in layers:
         _log(f"[扣图] → 分割图层 {layer_idx}（全画布 {canvas_img.size}）")
         seg = piseg_pil(canvas_img, cates, log_fn=log_fn)
         if seg is None:
@@ -294,10 +450,14 @@ def identify_product_layer(psd_path, level1_cat, level3_cat, log_fn=None):
         if seg_idx < len(all_seg_meta):
             layer_idx, _ = all_seg_meta[seg_idx]
             if layer_idx not in layer_best:
-                layer_best[layer_idx] = {'rank': rank_pos, 'score': seg_scores[rank_pos]}
+                layer_best[layer_idx] = {
+                    'rank': rank_pos,
+                    'score': seg_scores[rank_pos],
+                    'method': 'api'
+                }
 
-    _log("[扣图] 识别结果:")
-    for layer_idx, layer_name, _ in layers:
+    _log("[扣图] API 识别结果:")
+    for layer_idx, layer_name, _li, _ci in layers:
         if layer_idx in layer_best:
             r = layer_best[layer_idx]
             _log(f"  图层 {layer_idx} ({layer_name}): rank={r['rank']}, score={r['score']:.4f}")
@@ -305,6 +465,42 @@ def identify_product_layer(psd_path, level1_cat, level3_cat, log_fn=None):
             _log(f"  图层 {layer_idx} ({layer_name}): 无有效分割")
 
     return layer_best
+
+
+def identify_product_layer(psd_path, level1_cat, level3_cat, log_fn=None):
+    """
+    主函数：识别 PSD 中哪个 'scenebg' 图层是商品主体。
+
+    策略（优先级从高到低）：
+      Case 1 — 透明度检测（无 API）：若某图层已是扣好的主体，直接返回。
+      Case 2 — piseg API：Case 1 无结果时，调用 API 分割并排名。
+
+    返回:
+        { layer_index: {'rank': int, 'score': float, 'method': str}, ... }
+        rank 越小越可能是商品主体；空 dict 表示识别失败。
+    """
+    def _log(msg):
+        (log_fn or print)(msg)
+
+    _log(f"[扣图] 开始识别: {Path(psd_path).name}")
+    _log(f"[扣图] 品类: {level1_cat or '(未填)'} / {level3_cat or '(未填)'}")
+
+    layers = export_scenebg_layers(psd_path, log_fn=log_fn)
+    if not layers:
+        _log("[扣图] 未找到 scenebg 图层")
+        return {}
+
+    # ── Case 1：透明度检测 ──────────────────────────────────────────────────
+    _log("[扣图] Case 1：检测已有扣图图层…")
+    cutout = detect_existing_cutout(layers, log_fn=log_fn)
+    if cutout is not None:
+        layer_idx, layer_name = cutout
+        _log(f"[扣图] ✅ Case 1 命中：图层 {layer_idx} ({layer_name}) 已是商品扣图，直接命名")
+        return {layer_idx: {'rank': 0, 'score': 1.0, 'method': 'cutout'}}
+
+    # ── Case 2：API 分割 ────────────────────────────────────────────────────
+    _log("[扣图] Case 1 未找到扣图图层，尝试 Case 2：调用 piseg API…")
+    return _api_identify(layers, level1_cat, level3_cat, log_fn=log_fn)
 
 
 def rename_product_in_psd(psd_path, product_layer_index, new_name='product', log_fn=None):
@@ -345,13 +541,17 @@ def process_output_folder(output_folder, level1_cat, level3_cat, auto_rename=Tru
 
         best_idx = min(results, key=lambda k: results[k]['rank'])
         best = results[best_idx]
+        method = best.get('method', 'unknown')
         summary[psd_path.name] = {
             'layer_index': best_idx,
             'rank': best['rank'],
-            'score': best['score']
+            'score': best['score'],
+            'method': method
         }
+
+        method_label = "已有扣图（直接命名）" if method == 'cutout' else "API 识别"
         _log(f"[扣图] {psd_path.name}: 商品主体 = 图层 {best_idx}"
-             f"（rank={best['rank']}, score={best['score']:.4f}）")
+             f"（{method_label}，score={best['score']:.4f}）")
 
         if auto_rename:
             rename_product_in_psd(str(psd_path), best_idx, 'product', log_fn=log_fn)
