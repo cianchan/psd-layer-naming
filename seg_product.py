@@ -20,19 +20,46 @@ import re
 import socket
 import subprocess
 import tempfile
+import threading
 import time
 import requests
 from io import BytesIO
 from pathlib import Path
 
+import numpy as np
 from PIL import Image
 from psd_tools import PSDImage
 
+# #region agent log
+_DBG_PATH = "/Users/ziyan.chen/Documents/Sophie's File/vibe coding/psd layer naming/.cursor/debug-c3ab93.log"
+def _dbg(loc, msg, data=None, hid=""):
+    try:
+        with open(_DBG_PATH, 'a') as _f:
+            _f.write(json.dumps({"sessionId":"c3ab93","location":loc,"message":msg,"data":data or {},"timestamp":int(time.time()*1000),"hypothesisId":hid}) + '\n')
+    except: pass
+# #endregion
+
 # ── Shopee API 配置 ─────────────────────────────────────────────────────────
 
-_DEFAULT_GATEWAY = "https://http-gateway.spex.shopee.sg/sprpc"
-_DEFAULT_SDU = "ai_engine_platform.mmuplt.controller.global.liveish.master.default"
-_DEFAULT_SERVICEKEY = "f0dd2d544097d2a938595c1d78949bd3"
+_DEFAULT_GATEWAY       = "https://http-gateway.spex.shopee.sg/sprpc"
+_DEFAULT_PROXY_GATEWAY = "https://http-gateway-proxy.spex.shopee.sg/sprpc"
+_DEFAULT_SDU           = "ai_engine_platform.mmuplt.controller.global.liveish.master.default"
+_DEFAULT_SERVICEKEY    = "f0dd2d544097d2a938595c1d78949bd3"
+
+# Per-thread token so Flask request threads don't interfere with each other
+_tls = threading.local()
+
+def set_request_space_token(token: str):
+    _tls.space_token = token
+
+def clear_request_space_token():
+    _tls.space_token = None
+
+def _effective_space_token():
+    return getattr(_tls, 'space_token', None) \
+        or os.getenv("SHOPEE_USER_SPACE_TOKEN") \
+        or os.getenv("SHOPEE_AI_SPACE_TOKEN") \
+        or ""
 
 
 def _mask_secret(secret):
@@ -44,35 +71,47 @@ def _mask_secret(secret):
 
 
 def _api_config():
-    gateway = os.getenv("SHOPEE_AI_GATEWAY", _DEFAULT_GATEWAY).rstrip("/")
-    sdu = os.getenv("SHOPEE_AI_SDU", _DEFAULT_SDU)
-    servicekey = os.getenv("SHOPEE_AI_SERVICEKEY", _DEFAULT_SERVICEKEY)
+    explicit_gw = os.getenv("SHOPEE_AI_GATEWAY", "").strip()
+    use_proxy   = os.getenv("SHOPEE_AI_OFFICE_PROXY", "").strip() == "1"
+    token       = _effective_space_token()
+
+    if explicit_gw:
+        gateway = explicit_gw.rstrip("/")
+    elif use_proxy or token:
+        gateway = _DEFAULT_PROXY_GATEWAY
+    else:
+        gateway = _DEFAULT_GATEWAY
+
     return {
-        "gateway": gateway,
-        "sdu": sdu,
-        "servicekey": servicekey,
+        "gateway":    gateway,
+        "sdu":        os.getenv("SHOPEE_AI_SDU", _DEFAULT_SDU),
+        "servicekey": os.getenv("SHOPEE_AI_SERVICEKEY", _DEFAULT_SERVICEKEY),
+        "space_token": token,
     }
 
 
-def _build_headers(processid, timeout):
-    cfg = _api_config()
-    return {
-        "Content-Type": "application/json",
-        "x-sp-sdu": cfg["sdu"],
+def _build_headers(cfg, processid, timeout):
+    headers = {
+        "Content-Type":    "application/json",
+        "x-sp-sdu":        cfg["sdu"],
         "x-sp-servicekey": cfg["servicekey"],
-        "x-sp-timeout": str(timeout),
-        "x-sp-processid": processid,
+        "x-sp-timeout":    str(timeout),
+        "x-sp-processid":  processid,
     }
+    if cfg.get("space_token"):
+        headers["Authorization"] = f"Bearer {cfg['space_token']}"
+    return headers
 
 
 def call_service(service_name, request_data, env='liveish', max_retries=3, log_fn=None):
-    """调用 Shopee AI 服务（需要 Shopee VPN）。所有错误通过 log_fn 输出。"""
+    """调用 Shopee AI 服务。办公网需走 proxy + Bearer token。"""
     def _log(msg):
         (log_fn or print)(msg)
 
     cfg = _api_config()
     url = f"{cfg['gateway']}/ai_engine_platform.mmuplt.{service_name}.algo"
-    headers = _build_headers("CID=global", 30000) if service_name == 'seglabel2' else _build_headers("process_1", 60000)
+    headers = _build_headers(cfg, "CID=global", 30000) if service_name == 'seglabel2' \
+              else _build_headers(cfg, "process_1", 60000)
     host = url.split("/")[2]
 
     try:
@@ -86,7 +125,8 @@ def call_service(service_name, request_data, env='liveish', max_retries=3, log_f
                 _log(
                     f"  [API] {service_name} host={host} "
                     f"ip={resolved_ip or 'unresolved'} "
-                    f"sdu={cfg['sdu']} servicekey={_mask_secret(cfg['servicekey'])}"
+                    f"sdu={cfg['sdu']} servicekey={_mask_secret(cfg['servicekey'])} "
+                    f"token={_mask_secret(cfg['space_token'])}"
                 )
             resp = requests.post(url, data=json.dumps(request_data), headers=headers, timeout=60)
             if resp.status_code != 200:
@@ -96,8 +136,13 @@ def call_service(service_name, request_data, env='liveish', max_retries=3, log_f
                     f"{f' sgw-errmsg={gateway_msg}' if gateway_msg else ''}: "
                     f"{resp.text[:300]}"
                 )
-                if resp.status_code == 403:
-                    _log("  [API] 403 表示请求在网关层被拒绝，通常是 VPN / 白名单 / servicekey 权限问题，不是图片内容或 JSON 格式问题。")
+                # #region agent log
+                _dbg("seg_product.py:call_service:http_error", "http_non_200", {"service": service_name, "status": resp.status_code, "attempt": attempt, "sgw_errmsg": gateway_msg or "", "body": resp.text[:200]}, hid="H-L")
+                # #endregion
+                if resp.status_code == 401:
+                    _log("  [API] 401 → 需要 Bearer token（办公网必须经 proxy 域名 + user space token）")
+                elif resp.status_code == 403:
+                    _log("  [API] 403 → 网关拒绝：检查域名(proxy?)、token 是否过期、VPN/白名单")
                 if attempt < max_retries - 1:
                     time.sleep(1)
                     continue
@@ -105,19 +150,28 @@ def call_service(service_name, request_data, env='liveish', max_retries=3, log_f
             rj = resp.json()
             if 'task_result' not in rj:
                 _log(f"  [API] {service_name} 返回结构异常（无 task_result）: {str(rj)[:300]}")
+                # #region agent log
+                _dbg("seg_product.py:call_service:no_task_result", "missing_task_result", {"service": service_name, "attempt": attempt, "keys": list(rj.keys()), "snippet": str(rj)[:200]}, hid="H-L")
+                # #endregion
                 if attempt < max_retries - 1:
                     time.sleep(1)
                     continue
                 return None
             return rj['task_result']
         except requests.exceptions.ConnectionError as e:
-            _log(f"  [API] {service_name} 连接失败（请检查 Shopee VPN）: {e}")
+            _log(f"  [API] {service_name} 连接失败（请检查 VPN / 网络）: {e}")
+            # #region agent log
+            _dbg("seg_product.py:call_service:conn_error", "connection_error", {"service": service_name, "attempt": attempt, "error": str(e)[:200]}, hid="H-L")
+            # #endregion
             if attempt < max_retries - 1:
                 time.sleep(1)
                 continue
             return None
         except Exception as e:
             _log(f"  [API] {service_name} 异常: {e}")
+            # #region agent log
+            _dbg("seg_product.py:call_service:exception", "general_exception", {"service": service_name, "attempt": attempt, "error": str(e)[:200], "type": type(e).__name__}, hid="H-L")
+            # #endregion
             if attempt < max_retries - 1:
                 time.sleep(1)
                 continue
@@ -129,16 +183,19 @@ def call_service(service_name, request_data, env='liveish', max_retries=3, log_f
 
 def pil_to_base64(pil_image, max_size=1024):
     """
-    将 PIL 图片转为 base64 字符串。
-    如果图片超过 max_size，等比缩放以控制 payload 大小。
+    将 PIL 图片转为 base64 字符串（RGB，白底，JPEG）。
+    piseg API 期望普通照片（RGB），不能发 RGBA 透明背景。
+    使用 JPEG 而非 PNG 以控制 payload 大小（避免网关 413）。
     """
     img = pil_image.convert("RGBA")
     w, h = img.size
     if w > max_size or h > max_size:
         ratio = min(max_size / w, max_size / h)
         img = img.resize((int(w * ratio), int(h * ratio)), Image.LANCZOS)
+    bg = Image.new('RGB', img.size, (255, 255, 255))
+    bg.paste(img, mask=img.split()[3])
     buf = BytesIO()
-    img.save(buf, format='PNG', optimize=True)
+    bg.save(buf, format='JPEG', quality=90)
     return base64.b64encode(buf.getvalue()).decode('utf-8')
 
 
@@ -146,6 +203,17 @@ def base64_to_pil(base64_str):
     """Decode a base64-encoded image returned by the segmentation service."""
     image_data = base64.b64decode(base64_str)
     return Image.open(BytesIO(image_data)).convert("RGBA")
+
+
+def _recompress_b64_to_jpeg(seg_b64, quality=85):
+    """Re-encode a segment base64 (usually PNG from piseg) to JPEG to stay under
+    the API gateway payload limit that causes HTTP 413."""
+    img = base64_to_pil(seg_b64)
+    bg = Image.new('RGB', img.size, (255, 255, 255))
+    bg.paste(img, mask=img.split()[3])
+    buf = BytesIO()
+    bg.save(buf, format='JPEG', quality=quality)
+    return base64.b64encode(buf.getvalue()).decode('utf-8')
 
 
 def piseg_pil(pil_image, cates, env='liveish', log_fn=None):
@@ -168,6 +236,10 @@ def piseg_pil(pil_image, cates, env='liveish', log_fn=None):
     }
     res = call_service('pisegv2', req, env=env, log_fn=log_fn)
     if res is None:
+        _log(f"  [API] pisegv2 call_service 返回 None")
+        # #region agent log
+        _dbg("seg_product.py:piseg_pil:call_none", "call_service_returned_none", {"service": "pisegv2"}, hid="H-K")
+        # #endregion
         return None
     try:
         ei = json.loads(res['extra_info'])
@@ -176,15 +248,22 @@ def piseg_pil(pil_image, cates, env='liveish', log_fn=None):
         labels = ei.get('object_labels', [])
         if not imgs:
             _log(f"  [API] pisegv2 返回 0 个分割块（图层中未检测到独立对象）")
+            # #region agent log
+            _dbg("seg_product.py:piseg_pil:zero_segs", "piseg_zero_segments", {"extra_info_keys": list(ei.keys())}, hid="H-K")
+            # #endregion
             return None
         return imgs, bboxes, labels
     except Exception as e:
         _log(f"  [API] piseg 结果解析失败: {e}  原始: {str(res)[:200]}")
+        # #region agent log
+        _dbg("seg_product.py:piseg_pil:parse_error", "piseg_parse_error", {"error": str(e)}, hid="H-K")
+        # #endregion
         return None
 
 
 def tagging_base64(seg_b64, level3_cat, bbox, seg_label, env='liveish', log_fn=None):
     """对分割块（base64）调用打标签服务。返回标签列表或 None。"""
+    seg_b64_jpeg = _recompress_b64_to_jpeg(seg_b64)
     extra = json.dumps({
         'bbox': bbox,
         'source_url': '',
@@ -195,7 +274,7 @@ def tagging_base64(seg_b64, level3_cat, bbox, seg_label, env='liveish', log_fn=N
         "biz_type": "mmu_algo_test",
         "region": "sg",
         "task": {
-            "image_list": [{"image_data": seg_b64, "extra_info": extra}],
+            "image_list": [{"image_data": seg_b64_jpeg, "extra_info": extra}],
             "extra_info": json.dumps({'type': 'pimg'})
         }
     }
@@ -210,15 +289,16 @@ def tagging_base64(seg_b64, level3_cat, bbox, seg_label, env='liveish', log_fn=N
         return None
 
 
-def rank_segments(label_list, bbox_list, level1_cat, level3_cat, env='liveish', log_fn=None):
+def rank_segments(label_list, bbox_list, level1_cat, level3_cat,
+                  img_width=1024, img_height=1024, env='liveish', log_fn=None):
     """对所有分割块一起打分排名。返回排名结果字典或 None。"""
     text_list = [
         {
             'text': json.dumps(label),
             'extra_info': json.dumps({
                 'box': bbox,
-                'ori_img_height': 1024,
-                'ori_img_width': 1024,
+                'ori_img_height': img_height,
+                'ori_img_width': img_width,
                 'l1': level1_cat,
                 'l3': level3_cat
             })
@@ -236,12 +316,34 @@ def rank_segments(label_list, bbox_list, level1_cat, level3_cat, env='liveish', 
     return call_service('pfilter2', req, env=env, log_fn=log_fn)
 
 
+def _load_project_dotenv():
+    """Load .env from project directory (for CLI usage; app.py has its own loader)."""
+    env_path = Path(__file__).parent / ".env"
+    if not env_path.is_file():
+        return
+    for line in env_path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        key, val = key.strip(), val.strip()
+        if key and key not in os.environ:
+            os.environ[key] = val
+
+
 def probe_api(log_fn=None):
     """Minimal connectivity probe for the first-stage segmentation endpoint."""
+    _load_project_dotenv()
+
     def _log(msg):
         (log_fn or print)(msg)
 
-    _log("[探测] 开始探测 Shopee segmentation API 网关")
+    cfg = _api_config()
+    _log(f"[探测] 开始探测 Shopee segmentation API 网关")
+    _log(f"[探测] gateway={cfg['gateway']}")
+    _log(f"[探测] token={_mask_secret(cfg['space_token'])}")
     req = {
         "biz_type": "mmu_test",
         "region": "sg2",
@@ -249,7 +351,7 @@ def probe_api(log_fn=None):
     }
     res = call_service("pisegv2", req, log_fn=log_fn, max_retries=1)
     if res is None:
-        _log("[探测] 结果: 接口未通过。若日志中出现 403，优先检查 VPN / 白名单 / servicekey 权限。")
+        _log("[探测] 结果: 接口未通过。若日志中出现 403/401，检查 proxy 域名 + token。")
         return False
     _log("[探测] 结果: 网关可用。")
     return True
@@ -370,9 +472,15 @@ def _bbox_to_xyxy(bbox):
 
 
 def _segment_to_full_canvas(seg_b64, bbox, doc_size):
-    """Paste a cropped segmentation image back onto a transparent full-canvas image."""
+    """Place a segmentation image onto a transparent full-canvas image.
+    piseg returns two formats: cropped (size matches bbox) or full-canvas
+    (size matches doc, product already positioned). Handle both."""
     doc_w, doc_h = doc_size
     seg_img = base64_to_pil(seg_b64)
+
+    if seg_img.size[0] == doc_w and seg_img.size[1] == doc_h:
+        return seg_img
+
     full_canvas = Image.new('RGBA', (doc_w, doc_h), (0, 0, 0, 0))
     left, top, _, _ = _bbox_to_xyxy(bbox)
     full_canvas.paste(seg_img, (left, top), seg_img)
@@ -397,6 +505,93 @@ def _should_split_candidate(source_metrics, segment_metrics):
     if source_metrics.get('bbox_ratio', 0.0) > 0.55 and coverage < 0.9:
         return True
     return False
+
+
+def _validate_product_segment(seg_b64, bbox, doc_size, log_fn=None):
+    """
+    Validate that a segment from the API is a plausible product cutout.
+
+    Reference patterns (20+ PSD files):
+    - Products have transparency_ratio 0.01–0.70
+    - Products fill 3–80% of canvas (most 10–40%)
+    - Products are NOT the entire background or a solid color block
+    """
+    def _log(msg):
+        (log_fn or print)(msg)
+
+    try:
+        seg_img = base64_to_pil(seg_b64)
+        w, h = seg_img.size
+        doc_w, doc_h = doc_size
+        doc_area = max(doc_w * doc_h, 1)
+
+        left, top, right, bottom = _bbox_to_xyxy(bbox)
+        seg_w = max(right - left, 1)
+        seg_h = max(bottom - top, 1)
+        bbox_area = seg_w * seg_h
+        bbox_ratio = bbox_area / doc_area
+
+        alpha = seg_img.getchannel('A')
+        alpha_hist = alpha.histogram()
+        total_px = max(sum(alpha_hist), 1)
+        opaque_count = sum(alpha_hist[50:])
+        opaque_frac = opaque_count / total_px
+        has_real_alpha = opaque_frac < 0.95
+
+        _log(f"  [验证] seg={w}×{h} bbox=({left},{top},{right},{bottom}) "
+             f"bbox_ratio={bbox_ratio:.1%} opaque={opaque_frac:.1%} has_alpha={has_real_alpha}")
+
+        if bbox_ratio > 0.92:
+            _log(f"  [验证] ✗ 分割块 bbox 覆盖 {bbox_ratio:.0%} 画布 → 不是独立商品")
+            # #region agent log
+            _dbg("seg_product.py:_validate:reject_bg", "rejected_as_background", {"bbox_ratio": round(bbox_ratio, 4), "opaque_frac": round(opaque_frac, 4)}, hid="H-G")
+            # #endregion
+            return False
+
+        if bbox_ratio < 0.01:
+            _log(f"  [验证] ✗ 太小 ({bbox_ratio:.1%} 画布)")
+            # #region agent log
+            _dbg("seg_product.py:_validate:reject_small", "rejected_too_small", {"bbox_ratio": round(bbox_ratio, 4)}, hid="H-A")
+            # #endregion
+            return False
+
+        rgb = seg_img.convert('RGB')
+        extrema = rgb.getextrema()
+        r_range = extrema[0][1] - extrema[0][0]
+        g_range = extrema[1][1] - extrema[1][0]
+        b_range = extrema[2][1] - extrema[2][0]
+        if r_range < 10 and g_range < 10 and b_range < 10:
+            _log(f"  [验证] ✗ 近似纯色块 (R={r_range} G={g_range} B={b_range})")
+            # #region agent log
+            _dbg("seg_product.py:_validate:reject_solid", "rejected_solid_color", {"r_range": r_range, "g_range": g_range, "b_range": b_range}, hid="H-A")
+            # #endregion
+            return False
+
+        alpha_arr = np.array(alpha)
+        opaque_mask = alpha_arr > 50
+        if opaque_mask.any() and bbox_ratio > 0.10:
+            rgb_arr = np.array(rgb)
+            opaque_rgb = rgb_arr[opaque_mask]
+            brightness = opaque_rgb.mean(axis=1)
+            white_frac = float((brightness > 235).mean())
+            if white_frac > 0.80:
+                _log(f"  [验证] ✗ {white_frac:.0%} 近白色像素 → 背景碎片")
+                # #region agent log
+                _dbg("seg_product.py:_validate:reject_white", "rejected_white_fragment", {"white_frac": round(white_frac, 3), "bbox_ratio": round(bbox_ratio, 4)}, hid="H-A")
+                # #endregion
+                return False
+
+        _log(f"  [验证] ✓ 通过")
+        # #region agent log
+        _dbg("seg_product.py:_validate:pass", "segment_validated_ok", {"w": w, "h": h, "bbox_ratio": round(bbox_ratio, 4), "opaque_frac": round(opaque_frac, 4), "has_alpha": has_real_alpha, "color_range": [r_range, g_range, b_range]}, hid="H-A")
+        # #endregion
+        return True
+    except Exception as e:
+        _log(f"  [验证] 异常: {e}")
+        # #region agent log
+        _dbg("seg_product.py:_validate:exception", "validation_exception", {"error": str(e)}, hid="H-A")
+        # #endregion
+        return True
 
 
 def find_photoshop_app_name():
@@ -456,23 +651,49 @@ def _run_photoshop_jsx(jsx_code, log_fn=None, timeout=180):
         Path(as_path).unlink(missing_ok=True)
 
 
-def split_product_in_psd(psd_path, source_layer_index, product_png_path, new_name='product', log_fn=None):
+def apply_products_and_reorder(psd_path, products, log_fn=None):
     """
-    Insert a segmented product PNG as a new Photoshop layer and clear those pixels
-    from the original source layer, so the product is actually split out.
+    Single Photoshop session per PSD — insert all product layers and
+    reorder scenebg to bottom in one open/save/close cycle.
+
+    products: list of dicts with 'layer_index', 'png_path', 'name',
+              sorted by layer_index DESC (highest first to avoid index shifts).
     """
     def _log(msg):
         (log_fn or print)(msg)
 
     psd_path_js = str(psd_path).replace("\\", "/").replace("'", "\\'")
-    product_png_js = str(product_png_path).replace("\\", "/").replace("'", "\\'")
-    new_name_js = new_name.replace("\\", "\\\\").replace('"', '\\"')
+
+    insert_blocks = []
+    for p in products:
+        png_js = str(p['png_path']).replace("\\", "/").replace("'", "\\'")
+        name_js = p['name'].replace("\\", "\\\\").replace('"', '\\"')
+        idx = p['layer_index']
+        insert_blocks.append(f"""
+// --- product from layer {idx} ---
+var flat = [];
+flattenLayers(doc, flat);
+if ({idx} < flat.length && flat[{idx}].typename !== "LayerSet") {{
+    var src = flat[{idx}];
+    var segDoc = app.open(new File('{png_js}'));
+    if (segDoc.activeLayer.isBackgroundLayer) {{
+        segDoc.activeLayer.isBackgroundLayer = false;
+    }}
+    segDoc.activeLayer.duplicate(doc, ElementPlacement.PLACEATBEGINNING);
+    segDoc.close(SaveOptions.DONOTSAVECHANGES);
+    app.activeDocument = doc;
+    var pLyr = doc.layers[0];
+    pLyr.name = "{name_js}";
+    pLyr.move(src, ElementPlacement.PLACEBEFORE);
+}}""")
+
+    inserts_jsx = "\n".join(insert_blocks)
 
     jsx = f"""#target photoshop
 app.displayDialogs = DialogModes.NO;
 
 function flattenLayers(container, acc) {{
-    for (var i = 0; i < container.layers.length; i++) {{
+    for (var i = container.layers.length - 1; i >= 0; i--) {{
         var layer = container.layers[i];
         acc.push(layer);
         if (layer.typename === "LayerSet") {{
@@ -481,53 +702,29 @@ function flattenLayers(container, acc) {{
     }}
 }}
 
-function selectTransparency(layer) {{
-    var desc = new ActionDescriptor();
-    var ref = new ActionReference();
-    ref.putProperty(charIDToTypeID("Chnl"), charIDToTypeID("fsel"));
-    desc.putReference(charIDToTypeID("null"), ref);
-    var ref2 = new ActionReference();
-    ref2.putEnumerated(charIDToTypeID("Chnl"), charIDToTypeID("Chnl"), charIDToTypeID("Trsp"));
-    ref2.putIdentifier(charIDToTypeID("Lyr "), layer.id);
-    desc.putReference(charIDToTypeID("T   "), ref2);
-    executeAction(charIDToTypeID("setd"), desc, DialogModes.NO);
+var psdFile = new File('{psd_path_js}');
+if (!psdFile.exists) throw new Error("PSD file not found");
+var doc = app.open(psdFile);
+
+{inserts_jsx}
+
+// --- reorder scenebg to bottom ---
+var scenebgLayers = [];
+for (var i = 0; i < doc.layers.length; i++) {{
+    if (/^scenebg\\d*$/i.test(doc.layers[i].name)) {{
+        scenebgLayers.push(doc.layers[i]);
+    }}
+}}
+for (var j = 0; j < scenebgLayers.length; j++) {{
+    var bottom = doc.layers[doc.layers.length - 1];
+    if (bottom.isBackgroundLayer) {{
+        bottom.isBackgroundLayer = false;
+    }}
+    if (scenebgLayers[j] !== bottom) {{
+        scenebgLayers[j].move(bottom, ElementPlacement.PLACEAFTER);
+    }}
 }}
 
-var psdFile = new File('{psd_path_js}');
-var pngFile = new File('{product_png_js}');
-if (!psdFile.exists) throw new Error("PSD file not found");
-if (!pngFile.exists) throw new Error("Product PNG not found");
-
-var doc = app.open(psdFile);
-var flat = [];
-flattenLayers(doc, flat);
-if ({source_layer_index} >= flat.length) throw new Error("Source layer index out of range");
-var sourceLayer = flat[{source_layer_index}];
-if (sourceLayer.typename === "LayerSet") throw new Error("Source layer points to group");
-
-var segDoc = app.open(pngFile);
-segDoc.selection.selectAll();
-segDoc.selection.copy();
-segDoc.close(SaveOptions.DONOTSAVECHANGES);
-
-app.activeDocument = doc;
-var productLayer = doc.paste();
-productLayer.name = "{new_name_js}";
-doc.activeLayer = productLayer;
-selectTransparency(productLayer);
-
-doc.activeLayer = sourceLayer;
-try {{ sourceLayer.allLocked = false; }} catch(e) {{}}
-try {{ sourceLayer.transparentPixelsLocked = false; }} catch(e) {{}}
-try {{
-    if (sourceLayer.kind !== LayerKind.NORMAL) {{
-        sourceLayer.rasterize(RasterizeType.ENTIRELAYER);
-    }}
-}} catch(e) {{}}
-doc.selection.clear();
-doc.selection.deselect();
-
-doc.activeLayer = productLayer;
 var opts = new PhotoshopSaveOptions();
 opts.layers = true;
 opts.embedColorProfile = true;
@@ -540,7 +737,7 @@ doc.close(SaveOptions.DONOTSAVECHANGES);
 
     ok = _run_photoshop_jsx(jsx, log_fn=log_fn)
     if ok:
-        _log(f"[扣图] 已将分割主体写回 PSD，并命名为 '{new_name}'")
+        _log(f"[扣图] 已完成 {len(products)} 个 product 插入 + scenebg 规整（单次打开）")
     return ok
 
 
@@ -588,9 +785,6 @@ def _rank_local_candidates(layers, log_fn=None):
 def export_scenebg_layers(psd_path, log_fn=None):
     """
     打开处理后的 PSD，将所有名为 'scenebg' 的图层导出为 PIL image。
-    关键：每个图层粘贴在与 PSD 等大的全画布上（透明背景），
-    保留图层在画面中的位置上下文，让 API / 本地启发式都能判断主体。
-
     返回 [{layer_index, layer_name, layer_path, layer_img_rgba, canvas, metrics}, ...]
     """
     def _log(msg):
@@ -611,11 +805,10 @@ def export_scenebg_layers(psd_path, log_fn=None):
                 _log(f"  [PSD] 图层 {flat['layer_index']} composite() 返回 None，跳过")
                 continue
 
-            layer_img_rgba = layer_img.convert('RGBA')   # 图层自身（用于分析）
+            layer_img_rgba = layer_img.convert('RGBA')
 
-            # 粘贴到全画布，保留位置信息（用于 API 调用）
             canvas = Image.new('RGBA', (doc_w, doc_h), (0, 0, 0, 0))
-            bbox = layer.bbox   # tuple or BBox(left, top, right, bottom)
+            bbox = layer.bbox
             if hasattr(bbox, 'left'):
                 left, top = bbox.left, bbox.top
             else:
@@ -717,9 +910,15 @@ def detect_existing_cutout(layers, log_fn=None):
             rgb_crop = Image.merge('RGB', (r, g, b)).crop(bb)
             rgb_hist = rgb_crop.resize((32, 32), Image.LANCZOS).histogram()
 
+        nearly_opaque = sum(alpha_hist[200:])
+        semi_transparent = sum(alpha_hist[50:200])
+        content_pixels = nearly_opaque + semi_transparent
+        solid_ratio = nearly_opaque / content_pixels if content_pixels > 0 else 0
+
         _log(f"  [检测] 图层 {layer_idx} ({layer_name}): "
              f"图层自身透明比={transparent_ratio:.1%}, "
              f"内容面积={opaque_area/canvas_area:.1%}画布, "
+             f"solid_ratio={solid_ratio:.1%}, "
              f"图层尺寸={layer_img_rgba.size}")
 
         info.append({
@@ -728,30 +927,49 @@ def detect_existing_cutout(layers, log_fn=None):
             'opaque_area': opaque_area,
             'aspect': aspect,
             'rgb_hist': rgb_hist,
+            'solid_ratio': solid_ratio,
         })
 
     # ── 路径 A：透明扣图（图层自身有 alpha） ────────────────────────────────────
+    # Threshold lowered to 0.01 — reference products have 1–68% transparency;
+    # some on solid backgrounds have only 1–3%.
     a_candidates = []
     for d in info:
-        if not (0.10 <= d['transparent_ratio'] <= 0.88):
+        if not (0.01 <= d['transparent_ratio'] <= 0.88):
             continue
         if d['opaque_area'] < canvas_area * 0.03:
             _log(f"  [检测] 图层 {d['idx']} ({d['name']}): 内容面积太小 → A路径跳过")
             continue
-        if not (0.15 <= d['aspect'] <= 6.5):
+        if d['opaque_area'] > canvas_area * 1.0:
+            _log(f"  [检测] 图层 {d['idx']} ({d['name']}): 内容面积 {d['opaque_area']/canvas_area:.0%} 超出画布 → A路径跳过（疑为背景）")
+            continue
+        if not (0.25 <= d['aspect'] <= 4.0):
             _log(f"  [检测] 图层 {d['idx']} ({d['name']}): 宽高比 {d['aspect']:.2f} 异常 → A路径跳过")
             continue
+        if d['solid_ratio'] < 0.50:
+            _log(f"  [检测] 图层 {d['idx']} ({d['name']}): solid_ratio={d['solid_ratio']:.1%} (渐变/光效) → A路径跳过")
+            continue
         _log(f"  [检测] 图层 {d['idx']} ({d['name']}): ✓ 路径A候选 "
-             f"透明比={d['transparent_ratio']:.1%}, 宽高比={d['aspect']:.2f}")
+             f"透明比={d['transparent_ratio']:.1%}, 宽高比={d['aspect']:.2f}, "
+             f"solid_ratio={d['solid_ratio']:.1%}")
         a_candidates.append(d)
 
     # ── 路径 B：重复内容检测（两两直方图比较） ──────────────────────────────────
+    # Require the larger layer to be substantial (>15% canvas) — two small strips
+    # being similar doesn't indicate a product-scene relationship.
     b_candidates = {}
     for i in range(len(info)):
         for j in range(i + 1, len(info)):
             sim = cosine(info[i]['rgb_hist'], info[j]['rgb_hist'])
             if sim >= 0.80:
-                smaller = info[i] if info[i]['opaque_area'] <= info[j]['opaque_area'] else info[j]
+                if info[i]['opaque_area'] >= info[j]['opaque_area']:
+                    larger, smaller = info[i], info[j]
+                else:
+                    larger, smaller = info[j], info[i]
+                if larger['opaque_area'] < canvas_area * 0.15:
+                    _log(f"  [检测] 图层 {info[i]['idx']}↔{info[j]['idx']} "
+                         f"内容相似(sim={sim:.2f}) 但两者面积都较小 → B路径跳过")
+                    continue
                 _log(f"  [检测] 图层 {info[i]['idx']}↔{info[j]['idx']} "
                      f"内容相似(sim={sim:.2f}) → 小面积图层 {smaller['idx']} ({smaller['name']}) 路径B候选")
                 if smaller['idx'] not in b_candidates:
@@ -771,46 +989,171 @@ def detect_existing_cutout(layers, log_fn=None):
                  f"（唯一实质内容图层，面积={d['opaque_area']/canvas_area:.1%}）")
             c_candidates = [d]
         else:
-            # 排除面积最大的（= 场景背景）
             sorted_pool = sorted(c_pool, key=lambda x: x['opaque_area'], reverse=True)
             excluded = sorted_pool[0]
-            _log(f"  [检测] 图层 {excluded['idx']} ({excluded['name']}): "
-                 f"面积最大({excluded['opaque_area']/canvas_area:.1%}) → C路径排除（疑为场景背景）")
-            c_candidates = sorted_pool[1:]
-            for d in c_candidates:
-                _log(f"  [检测] 图层 {d['idx']} ({d['name']}): ✓ 路径C候选 "
-                     f"面积={d['opaque_area']/canvas_area:.1%}")
+            if excluded['opaque_area'] < canvas_area * 0.15:
+                _log(f"  [检测] C路径排除的最大图层面积仅 {excluded['opaque_area']/canvas_area:.1%}，"
+                     f"无明确场景背景 → C路径跳过全部")
+                c_candidates = []
+            else:
+                _log(f"  [检测] 图层 {excluded['idx']} ({excluded['name']}): "
+                     f"面积最大({excluded['opaque_area']/canvas_area:.1%}) → C路径排除（疑为场景背景）")
+                c_candidates = sorted_pool[1:]
+                for d in c_candidates:
+                    _log(f"  [检测] 图层 {d['idx']} ({d['name']}): ✓ 路径C候选 "
+                         f"面积={d['opaque_area']/canvas_area:.1%}")
     else:
         c_candidates = []
 
-    # ── 选择最终结果（优先级 B > C > A） ─────────────────────────────────────
+    # ── 选择最终结果（优先级 A > B > C），返回所有命中图层 ────────────────────
+    if a_candidates:
+        a_candidates.sort(key=lambda d: d['opaque_area'], reverse=True)
+        result = [(d['idx'], d['name']) for d in a_candidates]
+        _log(f"  [检测] ✅ 路径A 命中 {len(result)} 个图层: "
+             + ", ".join(f"{idx}({n})" for idx, n in result))
+        return result
+
     if b_candidates:
-        best = min(b_candidates.values(), key=lambda d: d['opaque_area'])
-        _log(f"  [检测] ✅ 路径B 命中：图层 {best['idx']} ({best['name']}) 为商品主体")
-        return best['idx'], best['name']
+        vals = sorted(b_candidates.values(), key=lambda d: d['opaque_area'])
+        result = [(d['idx'], d['name']) for d in vals]
+        _log(f"  [检测] ✅ 路径B 命中 {len(result)} 个图层: "
+             + ", ".join(f"{idx}({n})" for idx, n in result))
+        return result
 
     if c_candidates:
-        # 路径 C 中取面积最大的（最完整的商品图）
-        best = max(c_candidates, key=lambda d: d['opaque_area'])
-        _log(f"  [检测] ✅ 路径C 命中：图层 {best['idx']} ({best['name']}) 为商品主体 "
-             f"(面积={best['opaque_area']/canvas_area:.1%})")
-        return best['idx'], best['name']
-
-    if a_candidates:
-        best = max(a_candidates, key=lambda d: d['opaque_area'])
-        _log(f"  [检测] ✅ 路径A 命中：图层 {best['idx']} ({best['name']}) 为商品主体")
-        return best['idx'], best['name']
+        c_candidates.sort(key=lambda d: d['opaque_area'], reverse=True)
+        result = [(d['idx'], d['name']) for d in c_candidates]
+        _log(f"  [检测] ✅ 路径C 命中 {len(result)} 个图层: "
+             + ", ".join(f"{idx}({n})" for idx, n in result))
+        return result
 
     return None
+
+
+def _try_composite_piseg(composite_img, ref_layer, cates, doc_size,
+                         level1_cat, level3_cat, log_fn=None):
+    """
+    Send a composite of all scenebg layers to piseg.
+    Returns a result dict if a valid product segment is found, else None.
+    """
+    def _log(msg):
+        (log_fn or print)(msg)
+
+    seg = piseg_pil(composite_img, cates, log_fn=log_fn)
+    if seg is None:
+        _log("[扣图]   composite piseg 无结果")
+        # #region agent log
+        _dbg("seg_product.py:composite:no_seg", "composite_piseg_returned_none", {}, hid="H-J")
+        # #endregion
+        return None
+
+    seg_ims, bboxes, seg_labels = seg
+    _log(f"[扣图]   composite piseg 检测到 {len(seg_ims)} 个分割块")
+    # #region agent log
+    _dbg("seg_product.py:composite:piseg_result", "composite_piseg_segments", {"seg_count": len(seg_ims), "bboxes": bboxes}, hid="H-J")
+    # #endregion
+
+    all_labels, all_bboxes, all_seg_meta = [], [], []
+    for s_i, (s_b64, bbox, s_label) in enumerate(zip(seg_ims, bboxes, seg_labels)):
+        if not _validate_product_segment(s_b64, bbox, doc_size, log_fn=log_fn):
+            _log(f"[扣图]   composite 分割块 {s_i} 预验证失败")
+            continue
+
+        label = None
+        for _ in range(3):
+            label = tagging_base64(s_b64, level3_cat or '', bbox, s_label, log_fn=log_fn)
+            if label is not None:
+                break
+            time.sleep(1)
+        if label is None:
+            _log(f"[扣图]   composite 分割块 {s_i} 打标签失败")
+            continue
+
+        all_labels.append(label)
+        all_bboxes.append(bbox)
+        seg_canvas = _segment_to_full_canvas(s_b64, bbox, doc_size)
+        seg_metrics = _extract_local_metrics(seg_canvas, doc_size)
+        all_seg_meta.append({
+            'segment_base64': s_b64,
+            'segment_bbox': bbox,
+            'segment_label': s_label,
+            'segment_metrics': seg_metrics,
+        })
+
+    if not all_seg_meta:
+        _log("[扣图]   composite 无有效分割块")
+        return None
+
+    layer_idx = ref_layer['layer_index']
+    best_meta = None
+
+    if len(all_labels) > 0:
+        rank_raw = rank_segments(all_labels, all_bboxes,
+                                 level1_cat or '', level3_cat or '',
+                                 img_width=doc_size[0], img_height=doc_size[1],
+                                 log_fn=log_fn)
+        if rank_raw is not None:
+            try:
+                rank_data = json.loads(rank_raw['label'])
+                seg_ranks = rank_data['label']
+                seg_scores = rank_data['score']
+                # #region agent log
+                _dbg("seg_product.py:composite:ranking", "composite_ranking", {"seg_ranks": seg_ranks, "seg_scores": seg_scores}, hid="H-J")
+                # #endregion
+                for rank_pos in range(len(seg_ranks)):
+                    sidx = seg_ranks[rank_pos]
+                    if sidx < len(all_seg_meta):
+                        candidate = all_seg_meta[sidx]
+                        if _validate_product_segment(candidate['segment_base64'],
+                                                     candidate['segment_bbox'],
+                                                     doc_size, log_fn=log_fn):
+                            best_meta = candidate
+                            break
+            except Exception:
+                pass
+
+    if best_meta is None and all_seg_meta:
+        best_meta = all_seg_meta[0]
+
+    if best_meta is None:
+        return None
+
+    _log(f"[扣图]   ✅ composite 找到商品主体！")
+    # #region agent log
+    _dbg("seg_product.py:composite:found", "composite_product_found", {"layer_idx": layer_idx, "bbox": best_meta['segment_bbox']}, hid="H-J")
+    # #endregion
+    return {layer_idx: {
+        'rank': 0,
+        'score': 0.8,
+        'method': 'api',
+        'layer_path': ref_layer['layer_path'],
+        'segment_base64': best_meta['segment_base64'],
+        'segment_bbox': best_meta['segment_bbox'],
+        'segment_label': best_meta['segment_label'],
+        'source_metrics': ref_layer['metrics'],
+        'segment_metrics': best_meta['segment_metrics'],
+        'doc_size': doc_size,
+        'split_needed': True,
+        'action': 'split',
+    }}
 
 
 # ── Case 2：API 分割（兜底） ──────────────────────────────────────────────────
 
 def _api_identify(layers, level1_cat, level3_cat, log_fn=None):
     """
-    用 piseg API 在 scenebg 图层中寻找商品主体。
-    优先对最不透明（内容最多）的图层调用 API。
-    返回 { layer_idx: {'rank': int, 'score': float, 'method': 'api'} } 或 {}。
+    逐个 scenebg 图层调用 API，找到商品主体后立即返回。
+
+    对每个 scenebg 图层：
+      1. 跳过过小图层（<5% 画布，通常是装饰条/小元素）
+      2. piseg → 分割出对象
+      3. 预验证分割块（跳过纯色/过大/过小的）
+      4. seglabel2 → 给每个有效分割块打标签
+      5. pfilter2 → 排名
+      6. 按排名依次验证 → 首个通过验证的分割块就是商品主体
+      7. 如果这个图层没有有效分割 → 试下一个 scenebg
+
+    所有 scenebg 都没找到时回退到本地启发式（仅改名）。
     """
     def _log(msg):
         (log_fn or print)(msg)
@@ -820,30 +1163,72 @@ def _api_identify(layers, level1_cat, level3_cat, log_fn=None):
         _log("[本地识别] 没有可用的 scenebg 候选图层")
         return {}
 
-    if not level1_cat and not level3_cat:
-        _log("[扣图] 未提供品类，尝试使用通用 API 分割；若失败则回退到本地启发式结果")
-
     cates = [level1_cat or '', '', '']
-    all_labels, all_bboxes, all_seg_meta = [], [], []
+    found_products = {}
 
-    for item in layers:
+    first_canvas = layers[0]['canvas']
+    doc_size = first_canvas.size
+    canvas_area = first_canvas.width * first_canvas.height
+    min_opaque_for_api = max(int(canvas_area * 0.01), 1000)
+
+    sorted_layers = sorted(layers,
+                           key=lambda it: it['metrics'].get('opaque_pixels', 0),
+                           reverse=True)
+
+    # #region agent log
+    _dbg("seg_product.py:_api_identify:layer_order", "sorted_scenebg_layers", {"order": [{"idx": it['layer_index'], "path": it['layer_path'], "opaque_px": it['metrics'].get('opaque_pixels', 0)} for it in sorted_layers], "min_opaque_for_api": min_opaque_for_api, "canvas_area": canvas_area}, hid="H-I")
+    # #endregion
+
+    # Strategy A (composite) disabled — per-layer gives more reliable results
+    # and avoids layer-attribution issues with composite segments.
+
+    # ── Per-layer segmentation ──────────────────────────────────────
+    _log("[扣图] ── 逐层发送到 piseg ──")
+    for item in sorted_layers:
         layer_idx = item['layer_index']
+        if layer_idx in found_products:
+            continue
         canvas_img = item['canvas']
-        if item['metrics']['opaque_pixels'] <= 0:
-            _log(f"[扣图] → 跳过空图层 {layer_idx}（{item['layer_path']}）")
+        doc_size = canvas_img.size
+        opaque_px = item['metrics'].get('opaque_pixels', 0)
+
+        if opaque_px <= 0:
             continue
 
-        _log(f"[扣图] → 分割图层 {layer_idx}（{item['layer_path']}，全画布 {canvas_img.size}）")
+        if opaque_px < min_opaque_for_api:
+            _log(f"[扣图] 跳过图层 {layer_idx}（{item['layer_path']}）"
+                 f"内容太少: {opaque_px}px < {min_opaque_for_api}px")
+            # #region agent log
+            _dbg("seg_product.py:_api_identify:skip_small", "layer_skipped_min_size", {"layer_idx": layer_idx, "opaque_px": opaque_px, "min_required": min_opaque_for_api, "canvas_area": canvas_area}, hid="H-D")
+            # #endregion
+            continue
+
+        _log(f"[扣图] ── 检查图层 {layer_idx}（{item['layer_path']}，"
+             f"opaque={opaque_px}px/{canvas_area}px={opaque_px/canvas_area:.1%}）──")
+
+        # ── Step 1: piseg ────────────────────────────────────────────
         seg = piseg_pil(canvas_img, cates, log_fn=log_fn)
         if seg is None:
-            _log(f"[扣图]   piseg 失败，跳过图层 {layer_idx}")
+            _log(f"[扣图]   piseg 无结果，跳过")
+            # #region agent log
+            _dbg("seg_product.py:_api_identify:piseg_none", "piseg_returned_none", {"layer_idx": layer_idx, "opaque_px": opaque_px}, hid="H-K")
+            # #endregion
             continue
 
         seg_ims, bboxes, seg_labels = seg
-        _log(f"[扣图]   检测到 {len(seg_ims)} 个分割块")
+        _log(f"[扣图]   piseg 检测到 {len(seg_ims)} 个分割块")
+        # #region agent log
+        _dbg("seg_product.py:_api_identify:piseg_result", "piseg_returned_segments", {"layer_idx": layer_idx, "seg_count": len(seg_ims), "bboxes": bboxes, "labels": seg_labels}, hid="H-A")
+        # #endregion
 
+        # ── Step 2: pre-validate + tagging ───────────────────────────
+        all_labels, all_bboxes, all_seg_meta = [], [], []
         for s_i, (s_b64, bbox, s_label) in enumerate(zip(seg_ims, bboxes, seg_labels)):
-            _log(f"[扣图]   打标签 {s_i+1}/{len(seg_ims)}")
+            if not _validate_product_segment(s_b64, bbox, doc_size, log_fn=log_fn):
+                _log(f"[扣图]   分割块 {s_i} 预验证失败，跳过")
+                continue
+
+            _log(f"[扣图]   打标签 {s_i+1}/{len(seg_ims)}…")
             label = None
             for _ in range(3):
                 label = tagging_base64(s_b64, level3_cat or '', bbox, s_label, log_fn=log_fn)
@@ -852,92 +1237,145 @@ def _api_identify(layers, level1_cat, level3_cat, log_fn=None):
                 time.sleep(1)
             if label is None:
                 _log(f"[扣图]   打标签失败，跳过分割块 {s_i}")
+                # #region agent log
+                _dbg("seg_product.py:_api_identify:tagging_failed", "tagging_returned_none", {"layer_idx": layer_idx, "seg_idx": s_i}, hid="H-F")
+                # #endregion
                 continue
+            # #region agent log
+            _dbg("seg_product.py:_api_identify:tagging_ok", "tagging_success", {"layer_idx": layer_idx, "seg_idx": s_i, "label_sample": str(label)[:200]}, hid="H-F")
+            # #endregion
+
             all_labels.append(label)
             all_bboxes.append(bbox)
-            seg_canvas = _segment_to_full_canvas(s_b64, bbox, canvas_img.size)
-            seg_metrics = _extract_local_metrics(seg_canvas, canvas_img.size)
+            seg_canvas = _segment_to_full_canvas(s_b64, bbox, doc_size)
+            seg_metrics = _extract_local_metrics(seg_canvas, doc_size)
             all_seg_meta.append({
-                'layer_index': layer_idx,
-                'segment_index': s_i,
                 'segment_base64': s_b64,
                 'segment_bbox': bbox,
                 'segment_label': s_label,
-                'layer_path': item['layer_path'],
-                'source_metrics': item['metrics'],
                 'segment_metrics': seg_metrics,
-                'doc_size': canvas_img.size,
             })
 
-    if not all_labels:
-        _log("[扣图] 无有效分割块，API 可能不可用，回退到本地启发式结果")
-        return local_results
+        if not all_labels:
+            _log(f"[扣图]   无有效分割块，跳过此图层")
+            continue
 
-    _log(f"[扣图] 对 {len(all_labels)} 个分割块进行排名...")
-    rank_raw = rank_segments(all_labels, all_bboxes, level1_cat or '', level3_cat or '', log_fn=log_fn)
-    if rank_raw is None:
-        _log("[扣图] 排名 API 失败，回退到本地启发式结果")
-        return local_results
+        # ── Step 3: ranking ──────────────────────────────────────────
+        _log(f"[扣图]   对 {len(all_labels)} 个分割块排名…")
+        rank_raw = rank_segments(all_labels, all_bboxes,
+                                 level1_cat or '', level3_cat or '',
+                                 img_width=doc_size[0], img_height=doc_size[1],
+                                 log_fn=log_fn)
+        if rank_raw is None:
+            _log(f"[扣图]   排名失败，跳过此图层")
+            # #region agent log
+            _dbg("seg_product.py:_api_identify:ranking_failed", "ranking_returned_none", {"layer_idx": layer_idx}, hid="H-F")
+            # #endregion
+            continue
 
-    try:
-        rank_data  = json.loads(rank_raw['label'])
-        seg_ranks  = rank_data['label']
-        seg_scores = rank_data['score']
-    except Exception as e:
-        _log(f"[扣图] 排名结果解析失败: {e}  原始: {str(rank_raw)[:200]}")
-        _log("[扣图] 回退到本地启发式结果")
-        return local_results
+        try:
+            rank_data  = json.loads(rank_raw['label'])
+            seg_ranks  = rank_data['label']
+            seg_scores = rank_data['score']
+            # #region agent log
+            _dbg("seg_product.py:_api_identify:ranking_ok", "ranking_success", {"layer_idx": layer_idx, "seg_ranks": seg_ranks, "seg_scores": seg_scores}, hid="H-F")
+            # #endregion
+        except Exception as e:
+            _log(f"[扣图]   排名解析失败: {e}")
+            # #region agent log
+            _dbg("seg_product.py:_api_identify:ranking_parse_fail", "ranking_parse_error", {"layer_idx": layer_idx, "error": str(e), "raw": str(rank_raw)[:300]}, hid="H-F")
+            # #endregion
+            continue
 
-    layer_best: dict = {}
-    for rank_pos, seg_idx in enumerate(seg_ranks):
-        if seg_idx < len(all_seg_meta):
-            seg_meta = all_seg_meta[seg_idx]
-            layer_idx = seg_meta['layer_index']
-            if layer_idx not in layer_best:
-                split_needed = _should_split_candidate(seg_meta['source_metrics'], seg_meta['segment_metrics'])
-                layer_best[layer_idx] = {
-                    'rank': rank_pos,
-                    'score': seg_scores[rank_pos],
+        if not seg_ranks:
+            if all_seg_meta:
+                best_meta = all_seg_meta[0]
+                if not _should_split_candidate(item['metrics'], best_meta['segment_metrics']):
+                    _log(f"[扣图]   分割块覆盖整个图层（非真实抠图），跳过")
+                    continue
+                _log(f"[扣图]   排名为空但有预验证分割块，直接使用")
+                # #region agent log
+                _dbg("seg_product.py:_api_identify:empty_rank_fallback", "using_prevalidated_seg_despite_empty_rank", {"layer_idx": layer_idx, "bbox": best_meta['segment_bbox']}, hid="H-F2")
+                # #endregion
+                found_products[layer_idx] = {
+                    'rank': 0,
+                    'score': 0.5,
                     'method': 'api',
-                    'layer_path': seg_meta['layer_path'],
-                    'segment_base64': seg_meta['segment_base64'],
-                    'segment_bbox': seg_meta['segment_bbox'],
-                    'segment_label': seg_meta['segment_label'],
-                    'source_metrics': seg_meta['source_metrics'],
-                    'segment_metrics': seg_meta['segment_metrics'],
-                    'doc_size': seg_meta['doc_size'],
-                    'split_needed': split_needed,
-                    'action': 'split' if split_needed else 'rename',
+                    'layer_path': item['layer_path'],
+                    'segment_base64': best_meta['segment_base64'],
+                    'segment_bbox': best_meta['segment_bbox'],
+                    'segment_label': best_meta['segment_label'],
+                    'source_metrics': item['metrics'],
+                    'segment_metrics': best_meta['segment_metrics'],
+                    'doc_size': doc_size,
+                    'split_needed': True,
+                    'action': 'split',
                 }
+            continue
 
-    _log("[扣图] 识别结果:")
-    for item in layers:
-        layer_idx = item['layer_index']
-        layer_name = item['layer_path']
-        if layer_idx in layer_best:
-            r = layer_best[layer_idx]
-            _log(f"  图层 {layer_idx} ({layer_name}): rank={r['rank']}, score={r['score']:.4f}")
-        else:
-            _log(f"  图层 {layer_idx} ({layer_name}): 无有效分割")
+        # ── Step 4: iterate ranked segments, pick first valid ────────
+        for rank_pos in range(len(seg_ranks)):
+            seg_idx = seg_ranks[rank_pos]
+            score = seg_scores[rank_pos] if rank_pos < len(seg_scores) else 0.0
 
-    if not layer_best:
-        _log("[扣图] API 未返回可用候选，回退到本地启发式结果")
-        return local_results
+            if seg_idx >= len(all_seg_meta):
+                continue
 
-    return layer_best
+            best_meta = all_seg_meta[seg_idx]
+
+            _log(f"[扣图]   rank {rank_pos}: seg_idx={seg_idx} score={score:.4f}")
+
+            if not _validate_product_segment(best_meta['segment_base64'],
+                                             best_meta['segment_bbox'],
+                                             doc_size, log_fn=log_fn):
+                _log(f"[扣图]   rank {rank_pos} 后验证失败，跳过")
+                continue
+
+            if not _should_split_candidate(item['metrics'], best_meta['segment_metrics']):
+                _log(f"[扣图]   rank {rank_pos} 分割块覆盖整个图层，跳过")
+                continue
+
+            _log(f"[扣图]   ✅ 找到商品主体！rank={rank_pos} score={score:.4f}")
+
+            found_products[layer_idx] = {
+                'rank': 0,
+                'score': score,
+                'method': 'api',
+                'layer_path': item['layer_path'],
+                'segment_base64': best_meta['segment_base64'],
+                'segment_bbox': best_meta['segment_bbox'],
+                'segment_label': best_meta['segment_label'],
+                'source_metrics': item['metrics'],
+                'segment_metrics': best_meta['segment_metrics'],
+                'doc_size': doc_size,
+                'split_needed': True,
+                'action': 'split',
+            }
+            break
+
+        _log(f"[扣图]   该图层所有分割块均未通过验证")
+
+    if found_products:
+        _log(f"[扣图] 共找到 {len(found_products)} 个商品主体")
+        return found_products
+
+    _log("[扣图] 所有 scenebg 图层均未找到商品主体，回退到本地启发式结果")
+    return local_results
 
 
 def identify_product_layer(psd_path, level1_cat, level3_cat, log_fn=None):
     """
-    主函数：识别 PSD 中哪个 'scenebg' 图层是商品主体。
+    主函数：识别 PSD 中哪个 'scenebg' 图层是商品主体并获取分割数据。
 
-    策略（优先级从高到低）：
-      Case 1 — 透明度检测（无 API）：若某图层已是扣好的主体，直接返回。
-      Case 2 — piseg API：Case 1 无结果时，调用 API 分割并排名。
+    策略：
+      1. 本地透明度检测 — 标记哪些 scenebg 已经是人工抠图（不需要再抠）。
+      2. API pipeline（piseg → seglabel2 → pfilter2）— 确认哪些图层包含商品主体。
+         • API 确认含商品 + 已有抠图 → action='rename'（直接改名）
+         • API 确认含商品 + 非抠图   → action='split'（需要抠图）
+      3. 如果 API 不可用，回退到本地检测结果。
 
     返回:
-        { layer_index: {'rank': int, 'score': float, 'method': str}, ... }
-        rank 越小越可能是商品主体；空 dict 表示识别失败。
+        { layer_index: {'rank': int, 'score': float, 'method': str, ...}, ... }
     """
     def _log(msg):
         (log_fn or print)(msg)
@@ -950,17 +1388,51 @@ def identify_product_layer(psd_path, level1_cat, level3_cat, log_fn=None):
         _log("[扣图] 未找到 scenebg 图层")
         return {}
 
-    # ── Case 1：透明度检测 ──────────────────────────────────────────────────
-    _log("[扣图] Case 1：检测已有扣图图层…")
-    cutout = detect_existing_cutout(layers, log_fn=log_fn)
-    if cutout is not None:
-        layer_idx, layer_name = cutout
-        _log(f"[扣图] ✅ Case 1 命中：图层 {layer_idx} ({layer_name}) 已是商品扣图，直接命名")
-        return {layer_idx: {'rank': 0, 'score': 1.0, 'method': 'cutout'}}
+    # ── 1. 本地检测：标记已有人工抠图的图层 ──────────────────────────
+    _log("[扣图] 检测是否存在已抠好的商品主体…")
+    cutouts = detect_existing_cutout(layers, log_fn=log_fn)
+    cutout_indices = set(idx for idx, _ in cutouts) if cutouts else set()
+    if cutout_indices:
+        _log(f"[扣图] 本地检测到 {len(cutout_indices)} 个疑似已有抠图: {cutout_indices}")
 
-    # ── Case 2：API 分割 ────────────────────────────────────────────────────
-    _log("[扣图] Case 1 未找到扣图图层，尝试 Case 2：调用 piseg API…")
-    return _api_identify(layers, level1_cat, level3_cat, log_fn=log_fn)
+    # ── 2. API pipeline — 确认哪些图层真正包含商品主体 ────────────────
+    _log("[扣图] 调用 API pipeline（piseg → seglabel2 → pfilter2）…")
+    api_results = _api_identify(layers, level1_cat, level3_cat, log_fn=log_fn)
+
+    has_api_product = any(v.get('action') == 'split' for v in api_results.values())
+    if has_api_product:
+        for idx, info in api_results.items():
+            if info.get('action') == 'split' and idx in cutout_indices:
+                _log(f"[扣图] 图层 {idx}: API 确认含商品主体 + 已有人工抠图 → 直接改名")
+                info['action'] = 'rename'
+                info['split_needed'] = False
+                info.pop('segment_base64', None)
+                info.pop('segment_bbox', None)
+        _log("[扣图] API 成功找到商品主体")
+        return api_results
+
+    # ── 3. API 不可用时回退：使用本地检测结果 ────────────────────────
+    if cutouts:
+        _log("[扣图] API 未返回有效分割，使用本地检测结果")
+        results = {}
+        for rank, (idx, name) in enumerate(cutouts):
+            _log(f"[扣图] ✅ 本地检测到已有商品抠图: 图层 {idx} ({name})")
+            results[idx] = {
+                'rank': rank,
+                'score': 1.0,
+                'method': 'local_cutout',
+                'layer_path': name,
+                'split_needed': False,
+                'action': 'rename',
+            }
+        return results
+
+    if api_results:
+        _log("[扣图] 使用本地启发式排名结果（仅改名，不抠图）")
+        return api_results
+
+    _log("[扣图] 未能识别商品主体")
+    return {}
 
 
 def rename_product_in_psd(psd_path, product_layer_index, new_name='product', log_fn=None):
@@ -1018,6 +1490,10 @@ def process_output_folder(output_folder, level1_cat, level3_cat, auto_rename=Tru
             _log(f"[扣图] {psd_path.name}: 识别失败")
             continue
 
+        split_layers = {k: v for k, v in results.items()
+                        if v.get('action') == 'split' and v.get('segment_base64')}
+        rename_layers = {k: v for k, v in results.items() if k not in split_layers}
+
         best_idx = min(results, key=lambda k: results[k]['rank'])
         best = results[best_idx]
         method = best.get('method', 'unknown')
@@ -1025,45 +1501,63 @@ def process_output_folder(output_folder, level1_cat, level3_cat, auto_rename=Tru
             'layer_index': best_idx,
             'rank': best['rank'],
             'score': best['score'],
-            'action': best.get('action', 'rename'),
+            'action': 'split' if split_layers else best.get('action', 'rename'),
             'method': method,
+            'product_count': len(split_layers),
         }
 
-        if method == 'cutout':
-            method_label = "已有扣图（直接命名）"
-        elif method == 'local':
-            method_label = "本地启发式识别"
-        else:
-            method_label = "API 识别"
-        _log(f"[扣图] {psd_path.name}: 商品主体 = 图层 {best_idx}"
-             f"（{method_label}，score={best['score']:.4f}）")
+        _log(f"[扣图] {psd_path.name}: 找到 {len(split_layers)} 个需抠图, "
+             f"{len(rename_layers)} 个仅改名")
 
         if auto_rename:
-            if best.get('action') == 'split' and best.get('segment_base64'):
-                tmp_png_path = None
-                try:
-                    tmp_png_path = materialize_segment_png(
-                        best['segment_base64'],
-                        best['segment_bbox'],
-                        best['doc_size'],
-                        log_fn=log_fn
-                    )
-                    ok = split_product_in_psd(
-                        str(psd_path),
-                        best_idx,
-                        str(tmp_png_path),
-                        'product',
-                        log_fn=log_fn
-                    )
+            tmp_paths = []
+            if split_layers:
+                products = []
+                sorted_indices = sorted(split_layers.keys(), reverse=True)
+                use_numbering = len(sorted_indices) > 1
+                for seq, idx in enumerate(sorted(split_layers.keys()), start=1):
+                    info = split_layers[idx]
+                    try:
+                        tmp_png = materialize_segment_png(
+                            info['segment_base64'],
+                            info['segment_bbox'],
+                            info['doc_size'],
+                            log_fn=log_fn
+                        )
+                        name = f'product{seq}' if use_numbering else 'product'
+                        products.append({
+                            'layer_index': idx,
+                            'png_path': str(tmp_png),
+                            'name': name,
+                        })
+                        tmp_paths.append(tmp_png)
+                    except Exception as e:
+                        _log(f"[扣图] 图层 {idx} PNG 生成失败: {e}")
+
+                products.sort(key=lambda p: p['layer_index'], reverse=True)
+
+                if products:
+                    ok = apply_products_and_reorder(
+                        str(psd_path), products, log_fn=log_fn)
                     if not ok:
-                        _log("[扣图] 分割写回失败，回退为直接改名")
-                        rename_product_in_psd(str(psd_path), best_idx, 'product', log_fn=log_fn)
-                        summary[psd_path.name]['action'] = 'rename_fallback'
-                finally:
-                    if tmp_png_path:
-                        Path(tmp_png_path).unlink(missing_ok=True)
-            else:
-                rename_product_in_psd(str(psd_path), best_idx, 'product', log_fn=log_fn)
+                        _log(f"[扣图] {psd_path.name}: Photoshop 处理失败")
+
+                for p in tmp_paths:
+                    Path(p).unlink(missing_ok=True)
+
+            elif rename_layers:
+                sorted_renames = sorted(rename_layers.keys())
+                use_numbering = len(sorted_renames) > 1
+                psd = PSDImage.open(str(psd_path))
+                flat = _flatten_layers(psd)
+                for seq, idx in enumerate(sorted_renames, start=1):
+                    name = f'product{seq}' if use_numbering else 'product'
+                    if idx < len(flat):
+                        old = flat[idx]['layer'].name
+                        flat[idx]['layer'].name = name
+                        _log(f"[扣图] 图层 {idx}: '{old}' → '{name}'")
+                psd.save(str(psd_path))
+                apply_products_and_reorder(str(psd_path), [], log_fn=log_fn)
 
     return summary
 

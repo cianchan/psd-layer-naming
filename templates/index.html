@@ -20,27 +20,10 @@
 
   <main class="max-w-2xl mx-auto px-4 pb-16 space-y-4">
 
-    <!-- Step 1: Doc (optional) -->
+    <!-- Step 1: Folders -->
     <div class="bg-white rounded-2xl border border-gray-200 shadow-sm p-5">
       <div class="flex items-center gap-2 mb-3">
         <span class="w-6 h-6 rounded-full bg-indigo-100 text-indigo-700 text-xs font-bold flex items-center justify-center">1</span>
-        <h2 class="font-semibold text-gray-800">命名规则文档 <span class="text-xs font-normal text-gray-400">（可选）</span></h2>
-      </div>
-      <div class="flex gap-2">
-        <input id="doc-path" type="text"
-          class="flex-1 px-3 py-2 text-sm border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-300"
-          placeholder="可选：选择 .docx 文件解析规则" oninput="save()" />
-        <button onclick="pickFile('doc-path')"
-          class="px-3 py-2 text-sm border border-gray-300 rounded-lg bg-white hover:bg-gray-50 whitespace-nowrap">
-          📄 选择文件
-        </button>
-      </div>
-    </div>
-
-    <!-- Step 2: Folders -->
-    <div class="bg-white rounded-2xl border border-gray-200 shadow-sm p-5">
-      <div class="flex items-center gap-2 mb-3">
-        <span class="w-6 h-6 rounded-full bg-indigo-100 text-indigo-700 text-xs font-bold flex items-center justify-center">2</span>
         <h2 class="font-semibold text-gray-800">文件夹设置</h2>
       </div>
       <div class="space-y-3">
@@ -86,13 +69,24 @@
             </div>
           </div>
         </div>
+
+        <!-- User space token for office proxy -->
+        <div class="pt-1 border-t border-gray-100">
+          <label class="block text-sm text-gray-600 mb-1">User space token <span class="text-xs text-gray-400 font-normal">（办公网抠图必填，刷新后保留）</span></label>
+          <div class="flex gap-2">
+            <input id="space-token" type="password" placeholder="Bearer token（从 SPEX Space 页面获取）" oninput="save()"
+              class="flex-1 px-3 py-2 text-sm border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-300 font-mono" />
+            <button onclick="toggleTokenVis()" id="btn-toggle-token"
+              class="px-3 py-2 text-sm border border-gray-300 rounded-lg bg-white hover:bg-gray-50 whitespace-nowrap">👁 显示</button>
+          </div>
+        </div>
       </div>
     </div>
 
-    <!-- Step 3: Type-based naming -->
+    <!-- Step 2: Type-based naming -->
     <div class="bg-white rounded-2xl border border-gray-200 shadow-sm p-5">
       <div class="flex items-center gap-2 mb-1">
-        <span class="w-6 h-6 rounded-full bg-indigo-100 text-indigo-700 text-xs font-bold flex items-center justify-center">3</span>
+        <span class="w-6 h-6 rounded-full bg-indigo-100 text-indigo-700 text-xs font-bold flex items-center justify-center">2</span>
         <h2 class="font-semibold text-gray-800">图层命名配置</h2>
       </div>
       <p class="text-xs text-gray-400 mb-4 ml-8">按图层类型自动重命名，无需依赖原始图层名称。文字层自动编号（text1, text2…）。</p>
@@ -135,10 +129,10 @@
       </p>
     </div>
 
-    <!-- Step 4: Action -->
+    <!-- Step 3: Action -->
     <div class="bg-white rounded-2xl border border-gray-200 shadow-sm p-5">
       <div class="flex items-center gap-2 mb-4">
-        <span class="w-6 h-6 rounded-full bg-green-100 text-green-700 text-xs font-bold flex items-center justify-center">4</span>
+        <span class="w-6 h-6 rounded-full bg-green-100 text-green-700 text-xs font-bold flex items-center justify-center">3</span>
         <h2 class="font-semibold text-gray-800">开始处理</h2>
       </div>
 
@@ -155,11 +149,11 @@
       <p class="text-center text-xs text-gray-400 mt-2">自动打开 Photoshop 批量处理所有 PSD，完成后保存至输出文件夹</p>
       <p id="run-error" class="mt-2 text-xs text-red-500 hidden"></p>
 
-      <div id="run-result" class="hidden mt-4 flex items-center gap-3 p-3 bg-green-50 border border-green-200 rounded-xl">
-        <span class="text-2xl">✅</span>
+      <div id="run-result" class="hidden mt-4 flex items-center gap-3 p-3 rounded-xl">
+        <span id="run-result-icon" class="text-2xl"></span>
         <div>
-          <p class="text-sm font-semibold text-green-800">Photoshop 已启动，正在处理…</p>
-          <p class="text-xs text-green-700 mt-0.5">处理完成后 Photoshop 会弹出提示，PSD 文件将保存至输出文件夹。</p>
+          <p id="run-result-title" class="text-sm font-semibold"></p>
+          <p id="run-result-desc" class="text-xs mt-0.5"></p>
         </div>
       </div>
     </div>
@@ -186,13 +180,13 @@
     // ── Persist & Restore ────────────────────────────────────
     function save() {
       const data = {
-        docPath:     document.getElementById("doc-path").value,
         inputFolder: document.getElementById("input-folder").value,
         outputFolder:document.getElementById("output-folder").value,
         namePixel:   document.getElementById("name-pixel").value,
         nameShape:   document.getElementById("name-shape").value,
         segLevel1:   document.getElementById("seg-level1").value,
         segLevel3:   document.getElementById("seg-level3").value,
+        spaceToken:  document.getElementById("space-token").value,
       };
       localStorage.setItem(STORE_KEY, JSON.stringify(data));
     }
@@ -200,14 +194,21 @@
     function restore() {
       try {
         const data = JSON.parse(localStorage.getItem(STORE_KEY) || "{}");
-        if (data.docPath)      document.getElementById("doc-path").value      = data.docPath;
         if (data.inputFolder)  document.getElementById("input-folder").value  = data.inputFolder;
         if (data.outputFolder) document.getElementById("output-folder").value = data.outputFolder;
         if (data.namePixel)    document.getElementById("name-pixel").value    = data.namePixel;
         if (data.nameShape)    document.getElementById("name-shape").value    = data.nameShape;
         if (data.segLevel1)    document.getElementById("seg-level1").value    = data.segLevel1;
         if (data.segLevel3)    document.getElementById("seg-level3").value    = data.segLevel3;
+        if (data.spaceToken)   document.getElementById("space-token").value   = data.spaceToken;
       } catch(e) {}
+    }
+
+    function toggleTokenVis() {
+      const el = document.getElementById("space-token");
+      const btn = document.getElementById("btn-toggle-token");
+      if (el.type === "password") { el.type = "text"; btn.textContent = "🙈 隐藏"; }
+      else { el.type = "password"; btn.textContent = "👁 显示"; }
     }
 
     // ── Pickers ──────────────────────────────────────────────
@@ -265,6 +266,7 @@
       const nameShape    = document.getElementById("name-shape").value.trim() || "stickerbg";
       const segLevel1    = document.getElementById("seg-level1").value.trim();
       const segLevel3    = document.getElementById("seg-level3").value.trim();
+      const spaceToken   = document.getElementById("space-token").value.trim();
 
       if (!inputFolder)  { showErr("run-error", "请填写 PSD 输入文件夹"); return; }
       if (!outputFolder) { showErr("run-error", "请填写 PSD 输出文件夹"); return; }
@@ -277,12 +279,13 @@
             output_folder: outputFolder,
             level1_cat:    segLevel1,
             level3_cat:    segLevel3,
+            space_token:   spaceToken,
             type_rules: { pixel: namePixel, smart: namePixel, shape: nameShape }
           })
         });
         const d = await res.json();
         if (d.error) { showErr("run-error", d.error); setRunning(false); return; }
-        document.getElementById("run-result").classList.remove("hidden");
+        setResultBanner("running");
         appendLog("🚀 Photoshop 已启动，正在批量处理 PSD…");
         startLogPoller();
       } catch(e) {
@@ -298,7 +301,7 @@
         appendLog("⛔ 已发送终止指令");
       } catch(e) {}
       setRunning(false);
-      document.getElementById("run-result").classList.add("hidden");
+      setResultBanner("stopped");
     }
 
     function setRunning(running) {
@@ -331,9 +334,51 @@
           if (!d.running) {
             clearInterval(logPoller); logPoller = null;
             setRunning(false);
+            const hasError = (d.logs||[]).some(l => /❌/.test(l));
+            setResultBanner(hasError ? "error" : "done");
+            appendLog(hasError ? "⚠️ 处理完成（部分文件可能有错误，请查看上方日志）" : "✅ 全部处理完成！");
           }
         } catch(e) {}
       }, 2000);
+    }
+
+    function setResultBanner(state) {
+      const box   = document.getElementById("run-result");
+      const icon  = document.getElementById("run-result-icon");
+      const title = document.getElementById("run-result-title");
+      const desc  = document.getElementById("run-result-desc");
+      box.classList.remove("hidden","bg-green-50","border-green-200","bg-emerald-50","border-emerald-300","bg-red-50","border-red-200","bg-gray-50","border-gray-200");
+      box.classList.add("border");
+      if (state === "running") {
+        box.classList.add("bg-green-50","border-green-200");
+        icon.textContent  = "⏳";
+        title.textContent = "Photoshop 已启动，正在处理…";
+        title.className   = "text-sm font-semibold text-green-800";
+        desc.textContent  = "处理完成后状态会自动更新，请勿关闭此页面。";
+        desc.className    = "text-xs mt-0.5 text-green-700";
+      } else if (state === "done") {
+        box.classList.add("bg-emerald-50","border-emerald-300");
+        icon.textContent  = "✅";
+        title.textContent = "全部处理完成！";
+        title.className   = "text-sm font-semibold text-emerald-800";
+        desc.textContent  = "PSD 文件已保存至输出文件夹，可在 Photoshop 中查看结果。";
+        desc.className    = "text-xs mt-0.5 text-emerald-700";
+      } else if (state === "error") {
+        box.classList.add("bg-red-50","border-red-200");
+        icon.textContent  = "⚠️";
+        title.textContent = "处理完成，但部分文件出错";
+        title.className   = "text-sm font-semibold text-red-800";
+        desc.textContent  = "请查看运行日志中的 ❌ 标记，确认错误原因。";
+        desc.className    = "text-xs mt-0.5 text-red-700";
+      } else if (state === "stopped") {
+        box.classList.add("bg-gray-50","border-gray-200");
+        icon.textContent  = "⛔";
+        title.textContent = "处理已终止";
+        title.className   = "text-sm font-semibold text-gray-700";
+        desc.textContent  = "用户手动终止了处理流程。";
+        desc.className    = "text-xs mt-0.5 text-gray-500";
+      }
+      box.classList.remove("hidden");
     }
 
     // ── Helpers ──────────────────────────────────────────────

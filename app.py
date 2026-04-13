@@ -21,6 +21,26 @@ from pathlib import Path
 from flask import Flask, render_template, request, jsonify
 from docx import Document
 
+
+def _load_dotenv():
+    """Read .env in project root and set any missing env vars."""
+    env_path = Path(__file__).parent / ".env"
+    if not env_path.is_file():
+        return
+    for line in env_path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        key, val = key.strip(), val.strip()
+        if key and key not in os.environ:
+            os.environ[key] = val
+
+_load_dotenv()
+
+
 def find_photoshop_app_name():
     """Return the exact installed Photoshop app name for use in AppleScript tell blocks."""
     try:
@@ -163,10 +183,13 @@ def run():
             return jsonify({"error": f"请填写 {label}"}), 400
     # Categories are optional — empty strings let the API use its generic model
 
+    space_token   = data.get("space_token", "").strip()
+
     # Store categories for use in _watch thread
     job_state["level1_cat"] = level1_cat
     job_state["level3_cat"] = level3_cat
     job_state["output_folder"] = output_folder
+    job_state["space_token"] = space_token
 
     jsx_log_path = os.path.join(output_folder, "psd_renamer_jsx.log")
     stop_flag_path = os.path.join(output_folder, "psd_renamer_stop.flag")
@@ -199,8 +222,7 @@ def run():
         job_state["running"] = True
         log("🚀 Photoshop 已启动，正在执行脚本…")
 
-        def _watch(proc, out_folder, lvl1, lvl3):
-            # Poll log file for real-time updates while script runs
+        def _watch(proc, out_folder, lvl1, lvl3, token):
             last_size = 0
             while proc.poll() is None:
                 time.sleep(2)
@@ -213,7 +235,6 @@ def run():
                         last_size = len(content)
                 except Exception:
                     pass
-            # Flush remaining log lines after process exits
             _, stderr = proc.communicate()
             try:
                 content = Path(jsx_log_path).read_text(encoding="utf-8")
@@ -233,6 +254,8 @@ def run():
             log(f"🔍 开始识别商品主体图层（{lvl1} / {lvl3}）…")
             try:
                 import seg_product
+                if token:
+                    seg_product.set_request_space_token(token)
                 summary = seg_product.process_output_folder(
                     out_folder, lvl1, lvl3,
                     auto_rename=True,
@@ -244,12 +267,15 @@ def run():
                     log("⚠️ 未能识别商品主体（可尝试补充品类信息，或检查 PSD 中是否存在可见的 scenebg 图层）")
             except Exception as e:
                 log(f"❌ 商品主体识别出错: {e}")
+            finally:
+                import seg_product
+                seg_product.clear_request_space_token()
 
             job_state["running"] = False
 
         threading.Thread(
             target=_watch,
-            args=(ps_process, output_folder, level1_cat, level3_cat),
+            args=(ps_process, output_folder, level1_cat, level3_cat, space_token),
             daemon=True
         ).start()
 
@@ -296,6 +322,7 @@ def identify_products():
     level1_cat    = data.get("level1_cat", "").strip()
     level3_cat    = data.get("level3_cat", "").strip()
     auto_rename   = data.get("auto_rename", False)
+    space_token   = data.get("space_token", "").strip()
 
     if not output_folder or not os.path.isdir(output_folder):
         return jsonify({"error": "输出文件夹路径无效"}), 400
@@ -309,6 +336,8 @@ def identify_products():
     def _run_seg():
         try:
             import seg_product
+            if space_token:
+                seg_product.set_request_space_token(space_token)
             summary = seg_product.process_output_folder(
                 output_folder, level1_cat, level3_cat,
                 auto_rename=auto_rename,
@@ -334,6 +363,8 @@ def identify_products():
         except Exception as e:
             log(f"❌ 识别出错: {e}")
         finally:
+            import seg_product
+            seg_product.clear_request_space_token()
             job_state["running"] = False
 
     threading.Thread(target=_run_seg, daemon=True).start()
@@ -473,18 +504,38 @@ function isFrameStyleLayer(layer) {{
     g_frameCache[layer.id] = result;
     return result;
 }}
+// --- Check if a pixel/smart layer is a small decorative element (icon, badge, banner) ---
+function isSmallOverlay(layer) {{
+    if (!g_workDoc) return false;
+    try {{
+        var b = layer.bounds;
+        var w = b[2] - b[0];
+        var h = b[3] - b[1];
+        var docW = g_workDoc.width;
+        var docH = g_workDoc.height;
+        var wR = w / docW;
+        var hR = h / docH;
+        var areaRatio = wR * hR;
+        if (areaRatio < 0.10) {{
+            jsxLog("sticker detect [" + layer.name + "] area=" + (areaRatio * 100).toFixed(1) + "% → stickerbg");
+            return true;
+        }}
+    }} catch(e) {{}}
+    return false;
+}}
 // --- Get base name by layer type (visual frame check takes priority over type) ---
 function getBaseName(layer) {{
     var k = null;
     try {{ k = layer.kind; }} catch(e) {{}}
     var ks = "" + k;
-    // Text layers are always "text"
     if (k === K_TEXT   || k === 2  || ks === "LayerKind.TEXT")        return NAME_TEXT;
-    // Visual frame detection: hollow-center layers → "frame"
     if (isFrameStyleLayer(layer))                                      return NAME_FRAME;
-    if (k === K_SMART  || k === 17 || ks === "LayerKind.SMARTOBJECT") return NAME_SMART;
-    if (k === K_NORMAL || k === 1  || ks === "LayerKind.NORMAL")      return NAME_PIXEL;
-    // SOLIDFILL(3), GRADIENTFILL(4), PATTERNFILL(5), SHAPE(7), or unknown → shape
+    var isPixel = (k === K_NORMAL || k === 1  || ks === "LayerKind.NORMAL");
+    var isSmart = (k === K_SMART  || k === 17 || ks === "LayerKind.SMARTOBJECT");
+    if (isPixel || isSmart) {{
+        if (isSmallOverlay(layer)) return NAME_SHAPE;
+        return isPixel ? NAME_PIXEL : NAME_SMART;
+    }}
     return NAME_SHAPE;
 }}
 // --- Get ACTUAL displayed visibility via Action Manager (includes Layer Comp state) ---
@@ -868,4 +919,4 @@ if __name__ == "__main__":
     print("  PSD 图层重命名工具")
     print("  访问: http://127.0.0.1:7861")
     print("=" * 60)
-    app.run(host="127.0.0.1", port=7861, debug=False, use_reloader=True)
+    app.run(host="127.0.0.1", port=7861, debug=False, use_reloader=False)
