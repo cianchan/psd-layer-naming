@@ -651,13 +651,15 @@ def _run_photoshop_jsx(jsx_code, log_fn=None, timeout=180):
         Path(as_path).unlink(missing_ok=True)
 
 
-def apply_products_and_reorder(psd_path, products, log_fn=None):
+def apply_products_and_reorder(psd_path, products, renames=None, log_fn=None):
     """
-    Single Photoshop session per PSD — insert all product layers and
-    reorder scenebg to bottom in one open/save/close cycle.
+    Single Photoshop session per PSD — insert product layers, rename
+    existing layers, and reorder scenebg to bottom in one open/save/close.
 
-    products: list of dicts with 'layer_index', 'png_path', 'name',
-              sorted by layer_index DESC (highest first to avoid index shifts).
+    products: list of dicts with 'layer_index', 'png_path', 'name'
+              (insert new extracted product layer above source).
+    renames:  list of dicts with 'layer_index', 'name'
+              (rename existing layer in-place, no extraction needed).
     """
     def _log(msg):
         (log_fn or print)(msg)
@@ -684,10 +686,23 @@ if ({idx} < flat.length && flat[{idx}].typename !== "LayerSet") {{
     app.activeDocument = doc;
     var pLyr = doc.layers[0];
     pLyr.name = "{name_js}";
-    pLyr.move(src, ElementPlacement.PLACEBEFORE);
+    _productSourcePairs.push({{product: pLyr, source: src}});
 }}""")
 
     inserts_jsx = "\n".join(insert_blocks)
+
+    rename_blocks = []
+    for r in (renames or []):
+        rname_js = r['name'].replace("\\", "\\\\").replace('"', '\\"')
+        ridx = r['layer_index']
+        rename_blocks.append(f"""
+// --- rename layer {ridx} ---
+var flat = [];
+flattenLayers(doc, flat);
+if ({ridx} < flat.length && flat[{ridx}].typename !== "LayerSet") {{
+    flat[{ridx}].name = "{rname_js}";
+}}""")
+    renames_jsx = "\n".join(rename_blocks)
 
     jsx = f"""#target photoshop
 app.displayDialogs = DialogModes.NO;
@@ -706,7 +721,11 @@ var psdFile = new File('{psd_path_js}');
 if (!psdFile.exists) throw new Error("PSD file not found");
 var doc = app.open(psdFile);
 
+var _productSourcePairs = [];
+
 {inserts_jsx}
+
+{renames_jsx}
 
 // --- reorder scenebg to bottom ---
 var scenebgLayers = [];
@@ -723,6 +742,14 @@ for (var j = 0; j < scenebgLayers.length; j++) {{
     if (scenebgLayers[j] !== bottom) {{
         scenebgLayers[j].move(bottom, ElementPlacement.PLACEAFTER);
     }}
+}}
+
+// --- move each product directly above its source scenebg ---
+for (var k = 0; k < _productSourcePairs.length; k++) {{
+    try {{
+        var pair = _productSourcePairs[k];
+        pair.product.move(pair.source, ElementPlacement.PLACEBEFORE);
+    }} catch(e) {{}}
 }}
 
 var opts = new PhotoshopSaveOptions();
@@ -946,7 +973,7 @@ def detect_existing_cutout(layers, log_fn=None):
         if not (0.25 <= d['aspect'] <= 4.0):
             _log(f"  [检测] 图层 {d['idx']} ({d['name']}): 宽高比 {d['aspect']:.2f} 异常 → A路径跳过")
             continue
-        if d['solid_ratio'] < 0.50:
+        if d['solid_ratio'] < 0.30:
             _log(f"  [检测] 图层 {d['idx']} ({d['name']}): solid_ratio={d['solid_ratio']:.1%} (渐变/光效) → A路径跳过")
             continue
         _log(f"  [检测] 图层 {d['idx']} ({d['name']}): ✓ 路径A候选 "
@@ -1006,28 +1033,31 @@ def detect_existing_cutout(layers, log_fn=None):
         c_candidates = []
 
     # ── 选择最终结果（优先级 A > B > C），返回所有命中图层 ────────────────────
+    # Returns (results_list, path_letter) — path_letter indicates detection method.
+    # Only Path A = true pre-existing cutouts (transparent bg, no extraction needed).
+    # Paths B/C = product candidates on opaque backgrounds (still need extraction).
     if a_candidates:
         a_candidates.sort(key=lambda d: d['opaque_area'], reverse=True)
         result = [(d['idx'], d['name']) for d in a_candidates]
         _log(f"  [检测] ✅ 路径A 命中 {len(result)} 个图层: "
              + ", ".join(f"{idx}({n})" for idx, n in result))
-        return result
+        return result, 'A'
 
     if b_candidates:
         vals = sorted(b_candidates.values(), key=lambda d: d['opaque_area'])
         result = [(d['idx'], d['name']) for d in vals]
         _log(f"  [检测] ✅ 路径B 命中 {len(result)} 个图层: "
              + ", ".join(f"{idx}({n})" for idx, n in result))
-        return result
+        return result, 'B'
 
     if c_candidates:
         c_candidates.sort(key=lambda d: d['opaque_area'], reverse=True)
         result = [(d['idx'], d['name']) for d in c_candidates]
         _log(f"  [检测] ✅ 路径C 命中 {len(result)} 个图层: "
              + ", ".join(f"{idx}({n})" for idx, n in result))
-        return result
+        return result, 'C'
 
-    return None
+    return None, None
 
 
 def _try_composite_piseg(composite_img, ref_layer, cates, doc_size,
@@ -1390,10 +1420,15 @@ def identify_product_layer(psd_path, level1_cat, level3_cat, log_fn=None):
 
     # ── 1. 本地检测：标记已有人工抠图的图层 ──────────────────────────
     _log("[扣图] 检测是否存在已抠好的商品主体…")
-    cutouts = detect_existing_cutout(layers, log_fn=log_fn)
-    cutout_indices = set(idx for idx, _ in cutouts) if cutouts else set()
+    cutouts, cutout_path = detect_existing_cutout(layers, log_fn=log_fn)
+    # Only Path A (transparent background) = true pre-existing cutouts
+    # that don't need re-extraction. Paths B/C are product candidates
+    # on opaque backgrounds that still need API extraction.
+    cutout_indices = set(idx for idx, _ in cutouts) if cutouts and cutout_path == 'A' else set()
     if cutout_indices:
-        _log(f"[扣图] 本地检测到 {len(cutout_indices)} 个疑似已有抠图: {cutout_indices}")
+        _log(f"[扣图] 本地检测到 {len(cutout_indices)} 个已有人工抠图(路径A): {cutout_indices}")
+    elif cutouts:
+        _log(f"[扣图] 本地检测到 {len(cutouts)} 个商品候选(路径{cutout_path})，仍需 API 确认")
 
     # ── 2. API pipeline — 确认哪些图层真正包含商品主体 ────────────────
     _log("[扣图] 调用 API pipeline（piseg → seglabel2 → pfilter2）…")
@@ -1411,27 +1446,25 @@ def identify_product_layer(psd_path, level1_cat, level3_cat, log_fn=None):
         _log("[扣图] API 成功找到商品主体")
         return api_results
 
-    # ── 3. API 不可用时回退：使用本地检测结果 ────────────────────────
-    if cutouts:
-        _log("[扣图] API 未返回有效分割，使用本地检测结果")
+    # ── 3. API 不可用时回退：仅 Path A（透明已抠图）可直接改名 ─────
+    if cutouts and cutout_path == 'A':
+        _log(f"[扣图] API 未返回有效分割，使用本地路径A（透明背景已抠好的商品）")
         results = {}
         for rank, (idx, name) in enumerate(cutouts):
-            _log(f"[扣图] ✅ 本地检测到已有商品抠图: 图层 {idx} ({name})")
+            _log(f"[扣图] ✅ 已有透明抠图: 图层 {idx} ({name}) → 直接改名")
             results[idx] = {
                 'rank': rank,
                 'score': 1.0,
-                'method': 'local_cutout',
+                'method': 'local_A',
                 'layer_path': name,
                 'split_needed': False,
                 'action': 'rename',
             }
         return results
+    elif cutouts:
+        _log(f"[扣图] API 未返回有效分割，本地路径{cutout_path}候选不具备透明抠图 → 不做改名")
 
-    if api_results:
-        _log("[扣图] 使用本地启发式排名结果（仅改名，不抠图）")
-        return api_results
-
-    _log("[扣图] 未能识别商品主体")
+    _log("[扣图] 未能识别商品主体（API 未找到可抠图的商品，本地无透明抠图）")
     return {}
 
 
@@ -1511,11 +1544,15 @@ def process_output_folder(output_folder, level1_cat, level3_cat, auto_rename=Tru
 
         if auto_rename:
             tmp_paths = []
-            if split_layers:
-                products = []
-                sorted_indices = sorted(split_layers.keys(), reverse=True)
-                use_numbering = len(sorted_indices) > 1
-                for seq, idx in enumerate(sorted(split_layers.keys()), start=1):
+            total_products = len(split_layers) + len(rename_layers)
+            use_numbering = total_products > 1
+
+            all_indices = sorted(set(split_layers.keys()) | set(rename_layers.keys()))
+            products = []
+            renames = []
+            for seq, idx in enumerate(all_indices, start=1):
+                name = f'product{seq}' if use_numbering else 'product'
+                if idx in split_layers:
                     info = split_layers[idx]
                     try:
                         tmp_png = materialize_segment_png(
@@ -1524,7 +1561,6 @@ def process_output_folder(output_folder, level1_cat, level3_cat, auto_rename=Tru
                             info['doc_size'],
                             log_fn=log_fn
                         )
-                        name = f'product{seq}' if use_numbering else 'product'
                         products.append({
                             'layer_index': idx,
                             'png_path': str(tmp_png),
@@ -1533,31 +1569,23 @@ def process_output_folder(output_folder, level1_cat, level3_cat, auto_rename=Tru
                         tmp_paths.append(tmp_png)
                     except Exception as e:
                         _log(f"[扣图] 图层 {idx} PNG 生成失败: {e}")
+                else:
+                    renames.append({
+                        'layer_index': idx,
+                        'name': name,
+                    })
+                    _log(f"[扣图] 图层 {idx} → '{name}'（已有抠图，仅改名）")
 
-                products.sort(key=lambda p: p['layer_index'], reverse=True)
+            products.sort(key=lambda p: p['layer_index'], reverse=True)
 
-                if products:
-                    ok = apply_products_and_reorder(
-                        str(psd_path), products, log_fn=log_fn)
-                    if not ok:
-                        _log(f"[扣图] {psd_path.name}: Photoshop 处理失败")
+            if products or renames:
+                ok = apply_products_and_reorder(
+                    str(psd_path), products, renames=renames, log_fn=log_fn)
+                if not ok:
+                    _log(f"[扣图] {psd_path.name}: Photoshop 处理失败")
 
-                for p in tmp_paths:
-                    Path(p).unlink(missing_ok=True)
-
-            elif rename_layers:
-                sorted_renames = sorted(rename_layers.keys())
-                use_numbering = len(sorted_renames) > 1
-                psd = PSDImage.open(str(psd_path))
-                flat = _flatten_layers(psd)
-                for seq, idx in enumerate(sorted_renames, start=1):
-                    name = f'product{seq}' if use_numbering else 'product'
-                    if idx < len(flat):
-                        old = flat[idx]['layer'].name
-                        flat[idx]['layer'].name = name
-                        _log(f"[扣图] 图层 {idx}: '{old}' → '{name}'")
-                psd.save(str(psd_path))
-                apply_products_and_reorder(str(psd_path), [], log_fn=log_fn)
+            for p in tmp_paths:
+                Path(p).unlink(missing_ok=True)
 
     return summary
 

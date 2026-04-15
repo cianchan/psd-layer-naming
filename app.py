@@ -504,7 +504,33 @@ function isFrameStyleLayer(layer) {{
     g_frameCache[layer.id] = result;
     return result;
 }}
-// --- Check if a pixel/smart layer is a small decorative element (icon, badge, banner) ---
+// --- Check if a full-width/height strip is a solid color block (not a photo) ---
+function isColorBlock(layer) {{
+    try {{
+        var doc = g_workDoc;
+        if (!doc) return false;
+        var saved = [];
+        for (var i = 0; i < doc.layers.length; i++) {{
+            saved.push(doc.layers[i].visible);
+            doc.layers[i].visible = false;
+        }}
+        layer.visible = true;
+        var p = layer.parent;
+        while (p && p.typename !== "Document") {{ p.visible = true; p = p.parent; }}
+        var hist = doc.histogram;
+        for (var i = 0; i < doc.layers.length; i++) {{ doc.layers[i].visible = saved[i]; }}
+        var total = 0;
+        for (var k = 0; k < 256; k++) total += hist[k];
+        var thr = total * 0.001;
+        var sigBins = 0;
+        for (var k = 0; k < 256; k++) {{ if (hist[k] > thr) sigBins++; }}
+        jsxLog("color check [" + layer.name + "] sigBins=" + sigBins + " total=" + total);
+        return sigBins < 10;
+    }} catch(e) {{ return false; }}
+}}
+// --- Check if a pixel/smart layer is a decorative element (color block / icon) ---
+// Uses color complexity: solid colors / simple gradients → stickerbg,
+// photographic / complex content → scenebg.
 function isSmallOverlay(layer) {{
     if (!g_workDoc) return false;
     try {{
@@ -513,11 +539,10 @@ function isSmallOverlay(layer) {{
         var h = b[3] - b[1];
         var docW = g_workDoc.width;
         var docH = g_workDoc.height;
-        var wR = w / docW;
-        var hR = h / docH;
-        var areaRatio = wR * hR;
-        if (areaRatio < 0.10) {{
-            jsxLog("sticker detect [" + layer.name + "] area=" + (areaRatio * 100).toFixed(1) + "% → stickerbg");
+        var areaRatio = (w / docW) * (h / docH);
+        if (areaRatio >= 0.80) return false;
+        if (isColorBlock(layer)) {{
+            jsxLog("sticker detect [" + layer.name + "] area=" + (areaRatio * 100).toFixed(1) + "% sigBins<10 → stickerbg");
             return true;
         }}
     }} catch(e) {{}}
