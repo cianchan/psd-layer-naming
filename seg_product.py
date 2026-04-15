@@ -1544,14 +1544,11 @@ def process_output_folder(output_folder, level1_cat, level3_cat, auto_rename=Tru
 
         if auto_rename:
             tmp_paths = []
-            total_products = len(split_layers) + len(rename_layers)
-            use_numbering = total_products > 1
-
             all_indices = sorted(set(split_layers.keys()) | set(rename_layers.keys()))
             products = []
             renames = []
-            for seq, idx in enumerate(all_indices, start=1):
-                name = f'product{seq}' if use_numbering else 'product'
+            for idx in all_indices:
+                name = 'product'
                 if idx in split_layers:
                     info = split_layers[idx]
                     try:
