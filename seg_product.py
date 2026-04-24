@@ -1560,8 +1560,9 @@ def process_output_folder(output_folder, level1_cat, level3_cat, auto_rename=Tru
             all_indices = sorted(set(split_layers.keys()) | set(rename_layers.keys()))
             products = []
             renames = []
-            for idx in all_indices:
-                name = 'product'
+            for i, idx in enumerate(all_indices):
+                # 多个商品图层时编号：product1, product2, ...
+                name = 'product' if len(all_indices) == 1 else f'product{i + 1}'
                 if idx in split_layers:
                     info = split_layers[idx]
                     try:
