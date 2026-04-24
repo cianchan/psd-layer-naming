@@ -973,8 +973,8 @@ def detect_existing_cutout(layers, log_fn=None):
         if not (0.25 <= d['aspect'] <= 4.0):
             _log(f"  [检测] 图层 {d['idx']} ({d['name']}): 宽高比 {d['aspect']:.2f} 异常 → A路径跳过")
             continue
-        if d['solid_ratio'] < 0.30:
-            _log(f"  [检测] 图层 {d['idx']} ({d['name']}): solid_ratio={d['solid_ratio']:.1%} (渐变/光效) → A路径跳过")
+        if d['solid_ratio'] < 0.08:
+            _log(f"  [检测] 图层 {d['idx']} ({d['name']}): solid_ratio={d['solid_ratio']:.1%} (几乎纯渐变/光效) → A路径跳过")
             continue
         _log(f"  [检测] 图层 {d['idx']} ({d['name']}): ✓ 路径A候选 "
              f"透明比={d['transparent_ratio']:.1%}, 宽高比={d['aspect']:.2f}, "
@@ -1462,7 +1462,20 @@ def identify_product_layer(psd_path, level1_cat, level3_cat, log_fn=None):
             }
         return results
     elif cutouts:
-        _log(f"[扣图] API 未返回有效分割，本地路径{cutout_path}候选不具备透明抠图 → 不做改名")
+        # Path B/C 候选——无 API 时也改名，仅能确定图层位置但不能保证干净的透明抠图
+        _log(f"[扣图] API 未返回有效分割，使用本地路径{cutout_path}候选回退改名")
+        results = {}
+        for rank, (idx, name) in enumerate(cutouts):
+            _log(f"[扣图] ✅ 本地路径{cutout_path}: 图层 {idx} ({name}) → 改名为 product")
+            results[idx] = {
+                'rank': rank,
+                'score': 0.75,
+                'method': f'local_{cutout_path}',
+                'layer_path': name,
+                'split_needed': False,
+                'action': 'rename',
+            }
+        return results
 
     _log("[扣图] 未能识别商品主体（API 未找到可抠图的商品，本地无透明抠图）")
     return {}
